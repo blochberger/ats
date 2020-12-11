@@ -2,3 +2,7 @@
 */_CodeSignature
 atsdiag/atsdiag
 plsan/plsan
+
+# Python
+__pycache__
+*.egg-info
