@@ -98,7 +98,7 @@ class TestEnvironment:
 		return cls.path().exists()
 
 	@classmethod
-	def setup(cls):
+	def setup(cls, days: int):
 		assert not cls.exists()
 
 		path = cls.path()
@@ -113,7 +113,7 @@ class TestEnvironment:
 				'-out', str(cls.ca_certificate_path()),
 				'-subj', f'/O=ats.{cls.__name__}',
 				'-extensions', 'v3_ca',
-				'-days', '365',
+				'-days', str(days),
 			],
 			check=True,
 		)

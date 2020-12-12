@@ -225,7 +225,17 @@ def status():
 
 
 @test_environment.command()
-def setup():
+@click.option(
+	'--days',
+	type=click.INT,
+	default=28,
+	show_default=True,
+	help="""
+	The duration for which the test environment is valid. After that duration
+	the created root certificate will be invalid and tests will fail.
+	""",
+)
+def setup(days: int):
 	"""
 	Set the current user of the current machine up for testing.
 
@@ -247,7 +257,7 @@ def setup():
 	if TestEnvironment.exists():
 		raise click.ClickException("Test environment is already set up.")
 
-	TestEnvironment.setup()
+	TestEnvironment.setup(days=days)
 
 
 @test_environment.command()
