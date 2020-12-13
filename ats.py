@@ -1,8 +1,15 @@
 import enum
-import itertools
+import json
+import plistlib
 import re
+import subprocess
+import tempfile
 
-from typing import Any, Dict, Optional, Set
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Set
+
+from utilities import CodesigningIdentity, State, Utility
 
 
 @enum.unique
@@ -162,3 +169,104 @@ class Configuration(enum.IntFlag):
 			result['NSExceptionDomains'] = exceptions
 
 		return result
+
+
+@dataclass
+class DiagnoseUtility(Utility):
+
+	@classmethod
+	def name(self) -> str:
+		return 'atsdiag'
+
+	@classmethod
+	def start_compilation_with(
+		cls,
+		ats_configuration: Configuration,
+		exception_domains: Optional[Set[str]] = None,
+		target_path: Optional[Path] = None,
+		optimize: bool = True,
+	) -> 'DiagnoseUtility':
+		if exception_domains is None:
+			exception_domains = set()
+
+		with cls.default_info_plist_path().open('rb') as f:
+			info_plist = plistlib.load(f)
+
+		info_plist['NSAppTransportSecurity'] = ats_configuration.ats_dict(
+			domains=exception_domains,
+			simplify=False,
+		)
+
+		with tempfile.NamedTemporaryFile() as tmp:
+			tmp_path = Path(tmp.name)
+
+			with tmp_path.open('wb') as f:
+				plistlib.dump(info_plist, f, fmt=plistlib.FMT_XML)
+
+			atsdiag = cls.start_compilation(
+				target_path=target_path,
+				optimize=optimize,
+				info_plist_path=tmp_path,
+			)
+
+		return atsdiag
+
+	@classmethod
+	def compile_and_sign_with(
+		cls,
+		ats_configuration: Configuration,
+		exception_domains: Optional[Set[str]] = None,
+		target_path: Optional[Path] = None,
+		optimize: bool = True,
+		identity: Optional[CodesigningIdentity] = None,
+	) -> 'DiagnoseUtility':
+		# Compile
+		atsdiag = cls.start_compilation_with(
+			ats_configuration=ats_configuration,
+			exception_domains=exception_domains,
+			target_path=target_path,
+			optimize=optimize,
+		)
+		atsdiag.wait()
+
+		assert atsdiag._state is State.Compiled
+
+		# Sign
+		atsdiag.start_signing(identity=identity)
+		atsdiag.wait()
+
+		assert atsdiag.is_ready
+
+		return atsdiag
+
+	def start(self, urls: Set[str]):
+		assert self.is_ready
+
+		intermediate = subprocess.Popen(
+			[str(self.path)] + list(urls),
+			stdout=subprocess.PIPE,
+			stderr=subprocess.PIPE,
+			text=True,
+		)
+		self._start(intermediate)
+
+	def take_results(self) -> List[Dict[str, Any]]:
+		assert self.is_finished
+		assert self._intermediate is not None
+
+		stdout, stderr = self._intermediate.communicate()
+		results: List[Dict[str, Any]] = []
+		jsonlines = stdout.splitlines(keepends=False)
+		for line in jsonlines:
+			result: Dict[str, Any] = json.loads(line)
+			results.append(result)
+		self._finalize()
+		return results
+
+	def run(self, urls: Set[str]) -> List[Dict[str, Any]]:
+		self.start(urls)
+		self.wait()
+
+		assert self.is_finished
+
+		return self.take_results()

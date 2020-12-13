@@ -15,7 +15,6 @@ from tqdm import tqdm
 import ats
 from utilities import (
 	CodesigningIdentity,
-	DiagnoseUtility,
 	PlistSanitizer,
 	State,
 	Utility,
@@ -64,7 +63,7 @@ def compile(
 	Compile the `atsdiag` and `plsan` helper utilities.
 	"""
 
-	utility_classes = [DiagnoseUtility, PlistSanitizer]
+	utility_classes = [ats.DiagnoseUtility, PlistSanitizer]
 
 	with tqdm(
 		desc="Compiling utilities",
@@ -72,7 +71,7 @@ def compile(
 		leave=False,
 	) as progress:
 		utilities: List[Utility] = []
-		for cls in [DiagnoseUtility, PlistSanitizer]:
+		for cls in [ats.DiagnoseUtility, PlistSanitizer]:
 			utility = cls.start_compilation()
 			utilities.append(utility)
 
@@ -121,7 +120,7 @@ def diagnose(
 		click.BadArgumentUsage(f"Invalid URL: {url_}")
 	assert domain is not None
 
-	with DiagnoseUtility.default_info_plist_path().open('rb') as fp:
+	with ats.DiagnoseUtility.default_info_plist_path().open('rb') as fp:
 		info_plist = plistlib.load(fp)
 
 	configuration: Optional[ats.Configuration] = ats.Configuration.MostSecure
@@ -146,7 +145,7 @@ def diagnose(
 				plistlib.dump(info_plist, fp, fmt=plistlib.FMT_XML)
 
 			click.secho(f"Compiling {target_path}... ", nl=False, err=True)
-			atsdiag = DiagnoseUtility.compile_and_sign(
+			atsdiag = ats.DiagnoseUtility.compile_and_sign(
 				target_path=target_path,
 				info_plist_path=info_plist_path,
 				identity=codesigning_identity,

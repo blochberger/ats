@@ -5,14 +5,11 @@ import tempfile
 import unittest
 
 from pathlib import Path
-from pprint import pprint
 from time import sleep
 from typing import List, Optional, Tuple
 from random import randint
 
 import ats
-
-from utilities import DiagnoseUtility
 
 from tests import requires_test_environment, TestEnvironment, OPENSSL
 
@@ -34,7 +31,7 @@ class TestDiagnostics(unittest.TestCase):
 
 		target_path = self.temp_dir / 'atsdiag'
 
-		atsdiag = DiagnoseUtility.compile_and_sign(
+		atsdiag = ats.DiagnoseUtility.compile_and_sign(
 			target_path=target_path,
 		)
 
@@ -126,10 +123,10 @@ class TestDiagnosticsLive(unittest.TestCase):
 
 		self.server = None
 
-	def compile_helper(self) -> DiagnoseUtility:
+	def compile_helper(self) -> ats.DiagnoseUtility:
 		target_path = self.temp_dir / 'atsdiag'
 
-		atsdiag = DiagnoseUtility.compile_and_sign(
+		atsdiag = ats.DiagnoseUtility.compile_and_sign(
 			target_path=target_path,
 		)
 
@@ -150,7 +147,6 @@ class TestDiagnosticsLive(unittest.TestCase):
 		"""
 
 		test_data: List[Tuple[ats.TlsVersion, bool]] = [
-			# (tls_version: ats.TlsVersion, is_positive: bool)
 			(ats.TlsVersion.TLSv1_0, False),
 			(ats.TlsVersion.TLSv1_1, False),
 			(ats.TlsVersion.TLSv1_2, True),
@@ -159,7 +155,7 @@ class TestDiagnosticsLive(unittest.TestCase):
 			#(ats.TlsVersion.TLSv1_3, True),
 		]
 
-		atsdiag = self.compile_helper()
+		atsdiag = self.compile_helper()  # Uses default ATS configuration
 
 		for tls_version, is_positive in test_data:
 			with self.subTest(tls_version=str(tls_version), is_positive=is_positive):
