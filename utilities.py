@@ -1,11 +1,15 @@
 import enum
-import subprocess
-import re
 import json
+import plistlib
+import re
+import subprocess
+import tempfile
 
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Set, Type, TypeVar
+
+import ats
 
 
 U = TypeVar('U', bound='Utility')
@@ -220,9 +224,7 @@ class Utility:
 		obj.wait(until=State.Compiled)
 
 		# Sign
-		obj.start_signing(
-			identity=identity,
-		)
+		obj.start_signing(identity=identity)
 		obj.wait(until=State.Ready)
 
 		return obj
@@ -248,6 +250,63 @@ class DiagnoseUtility(Utility):
 	@classmethod
 	def name(self) -> str:
 		return 'atsdiag'
+
+	@classmethod
+	def start_compilation_with(
+		cls,
+		ats_configuration: ats.Configuration,
+		exception_domains: Optional[Set[str]] = None,
+		target_path: Optional[Path] = None,
+		optimize: bool = True,
+	) -> 'DiagnoseUtility':
+		if exception_domains is None:
+			exception_domains = set()
+
+		with cls.default_info_plist_path().open('rb') as f:
+			info_plist = plistlib.load(f)
+
+		info_plist['NSAppTransportSecurity'] = ats_configuration.ats_dict(
+			domains=exception_domains,
+			simplify=False,
+		)
+
+		with tempfile.NamedTemporaryFile() as tmp:
+			tmp_path = Path(tmp.name)
+
+			with tmp_path.open('wb') as f:
+				plistlib.dump(info_plist, f, fmt=plistlib.FMT_XML)
+
+			atsdiag = cls.start_compilation(
+				target_path=target_path,
+				optimize=optimize,
+				info_plist_path=tmp_path,
+			)
+
+		return atsdiag
+
+	@classmethod
+	def compile_and_sign_with(
+		cls,
+		ats_configuration: ats.Configuration,
+		exception_domains: Optional[Set[str]] = None,
+		target_path: Optional[Path] = None,
+		optimize: bool = True,
+		identity: Optional[CodesigningIdentity] = None,
+	) -> 'DiagnoseUtility':
+		# Compile
+		atsdiag = cls.start_compilation_with(
+			ats_configuration=ats_configuration,
+			exception_domains=exception_domains,
+			target_path=target_path,
+			optimize=optimize,
+		)
+		atsdiag.wait(until=State.Compiled)
+
+		# Sign
+		atsdiag.start_signing(identity=identity)
+		atsdiag.wait(until=State.Ready)
+
+		return atsdiag
 
 	def start(self, urls: Set[str]):
 		assert self.is_ready
