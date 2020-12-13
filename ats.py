@@ -34,12 +34,11 @@ class TlsVersion(enum.IntEnum):
 class Configuration(enum.IntFlag):
 	AllowsArbitraryLoads = 1 << 0
 	AllowsLocalNetworking = 1 << 1
-	IncludesSubdomains = 1 << 2 # TODO Remove
-	AllowsInsecureHttpLoads = 1 << 3
-	RequiresForwardSecrecy = 1 << 4
-	RequiresCertificateTransparency = 1 << 5
-	_TLS1 = 1 << 6
-	_TLS2 = 1 << 7
+	AllowsInsecureHttpLoads = 1 << 2
+	RequiresForwardSecrecy = 1 << 3
+	RequiresCertificateTransparency = 1 << 4
+	_TLS1 = 1 << 5
+	_TLS2 = 1 << 6
 
 	# Convenience flags
 
@@ -114,7 +113,6 @@ class Configuration(enum.IntFlag):
 		return {
 			cls.AllowsArbitraryLoads: 'NSAllowsArbitraryLoads',
 			cls.AllowsLocalNetworking: 'NSAllowsLocalNetworking',
-			cls.IncludesSubdomains: 'NSIncludesSubdomains',
 			cls.AllowsInsecureHttpLoads: 'NSExceptionAllowsInsecureHTTPLoads',
 			cls.RequiresForwardSecrecy: 'NSExceptionRequiresForwardSecrecy',
 			cls.RequiresCertificateTransparency: 'NSRequiresCertificateTransparency',
@@ -147,7 +145,6 @@ class Configuration(enum.IntFlag):
 			exception: Dict[str, Any] = dict()
 
 			flags = {
-				cls.IncludesSubdomains,
 				cls.AllowsInsecureHttpLoads,
 				cls.RequiresForwardSecrecy,
 				cls.RequiresCertificateTransparency,
@@ -165,42 +162,3 @@ class Configuration(enum.IntFlag):
 			result['NSExceptionDomains'] = exceptions
 
 		return result
-
-	@classmethod
-	def combinations(cls) -> Set['Configuration']:
-		results: Set['Configuration'] = set()
-
-		# FIXME What is actually required?
-
-		results.add(Configuration.Default | Configuration.AllowsArbitraryLoads)
-		results.add(Configuration.Default | Configuration.AllowsLocalNetworking)
-
-		combinations = itertools.product(
-			[True, False],  # includes subdomains
-			[True, False],  # insecure HTTP loads
-			list(TlsVersion),  # minimum TLS version
-			[True, False],  # requires forward secrecy
-			[True, False],  # requires certificate transparency
-		)
-		for subdomains, http, tls, fs, ct in combinations:
-			result = Configuration(0)
-			if subdomains:
-				result |= Configuration.IncludesSubdomains
-			if http:
-				result |= Configuration.AllowsInsecureHttpLoads
-			if tls is TlsVersion.TLSv1_0:
-				pass  # Nothing to do, TLSv1_0 is encoded as 0
-			elif tls is TlsVersion.TLSv1_1:
-				result |= Configuration.TLSv1_1
-			elif tls is TlsVersion.TLSv1_2:
-				result |= Configuration.TLSv1_2
-			elif tls is TlsVersion.TLSv1_3:
-				result |= Configuration.TLSv1_3
-			else:
-				raise NotImplementedError(f"Unhandled TlsVersion: {tls}")
-			if fs:
-				result |= Configuration.RequiresForwardSecrecy
-			if ct:
-				result |= Configuration.RequiresCertificateTransparency
-			results.add(result)
-		return results
