@@ -6,3 +6,5 @@ plsan/plsan
 # Python
 __pycache__
 *.egg-info
+.coverage
+htmlcov
