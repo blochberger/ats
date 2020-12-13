@@ -21,7 +21,7 @@ class TestEnvironment:
 
 	@classmethod
 	def ca_serial_path(cls) -> Path:
-		return cls.path() / 'ca.srl'
+		return cls.path() / 'ca.crt.srl'
 
 	@classmethod
 	def default_keychain_path(cls) -> Path:
