@@ -5,6 +5,9 @@ import unittest
 from pathlib import Path
 
 
+OPENSSL = '/usr/local/opt/openssl/bin/openssl'
+
+
 class TestEnvironment:
 
 	@classmethod
@@ -41,7 +44,7 @@ class TestEnvironment:
 		with tempfile.NamedTemporaryFile() as der:
 			subprocess.run(
 				[
-					'openssl', 'x509',
+					OPENSSL, 'x509',
 					'-in', str(cls.ca_certificate_path()),
 					'-inform', 'PEM',
 					'-out', der.name,
@@ -50,7 +53,7 @@ class TestEnvironment:
 				check=True,
 			)
 			dgst = subprocess.run(
-				['openssl', 'dgst', '-sha1', der.name],
+				[OPENSSL, 'dgst', '-sha1', der.name],
 				check=True,
 				capture_output=True,
 				text=True,
@@ -67,7 +70,7 @@ class TestEnvironment:
 			# Create certificate request
 			subprocess.run(
 				[
-					'openssl', 'req', '-new', '-nodes',
+					OPENSSL, 'req', '-new', '-nodes',
 					'-newkey', 'rsa:2048',
 					'-keyout', str(key_path),
 					'-out', csr.name,
@@ -80,7 +83,7 @@ class TestEnvironment:
 			# Sign certificate request with CA
 			subprocess.run(
 				[
-					'openssl', 'x509', '-req',
+					OPENSSL, 'x509', '-req',
 					'-in', csr.name,
 					'-CA', str(cls.ca_certificate_path()),
 					'-CAkey', str(cls.ca_key_path()),
@@ -101,13 +104,16 @@ class TestEnvironment:
 	def setup(cls, days: int):
 		assert not cls.exists()
 
+		if not Path(OPENSSL).exists():
+			raise Exception("Please install openssl via brew: brew install openssl")
+
 		path = cls.path()
 		path.mkdir(mode=0o700)
 
 		# Create self-signed CA certificate
 		subprocess.run(
 			[
-				'openssl', 'req', '-x509', '-nodes',
+				OPENSSL, 'req', '-x509', '-nodes',
 				'-newkey', 'rsa:2048',
 				'-keyout', str(cls.ca_key_path()),
 				'-out', str(cls.ca_certificate_path()),
