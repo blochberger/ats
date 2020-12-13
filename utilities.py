@@ -163,13 +163,15 @@ class Utility:
 			self._intermediate is not None and
 			self._intermediate.poll() is not None
 		):
-			self.wait(until=self._state.next)
+			self.wait()
 		return self._state
 
-	def wait(self, until: State, timeout: Optional[float] = None):
-		assert until in {State.Compiled, State.Ready, State.Finished}
-		assert until is self._state.next
+	def wait(self, timeout: Optional[float] = None):
 		assert self._intermediate is not None
+
+		until = self._state.next
+
+		assert until in {State.Compiled, State.Ready, State.Finished}
 
 		self._intermediate.wait(timeout)
 
@@ -221,11 +223,15 @@ class Utility:
 			optimize=optimize,
 			info_plist_path=info_plist_path,
 		)
-		obj.wait(until=State.Compiled)
+		obj.wait()
+
+		assert obj._state is State.Compiled
 
 		# Sign
 		obj.start_signing(identity=identity)
-		obj.wait(until=State.Ready)
+		obj.wait()
+
+		assert obj.is_ready
 
 		return obj
 
@@ -300,11 +306,15 @@ class DiagnoseUtility(Utility):
 			target_path=target_path,
 			optimize=optimize,
 		)
-		atsdiag.wait(until=State.Compiled)
+		atsdiag.wait()
+
+		assert atsdiag._state is State.Compiled
 
 		# Sign
 		atsdiag.start_signing(identity=identity)
-		atsdiag.wait(until=State.Ready)
+		atsdiag.wait()
+
+		assert atsdiag.is_ready
 
 		return atsdiag
 
@@ -334,7 +344,10 @@ class DiagnoseUtility(Utility):
 
 	def run(self, urls: Set[str]) -> List[Dict[str, Any]]:
 		self.start(urls)
-		self.wait(until=State.Finished)
+		self.wait()
+
+		assert self.is_finished
+
 		return self.take_results()
 
 
