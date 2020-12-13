@@ -7,14 +7,14 @@ import unittest
 from pathlib import Path
 from pprint import pprint
 from time import sleep
-from typing import List, Optional
+from typing import List, Optional, Tuple
 from random import randint
 
 import ats
 
 from utilities import DiagnoseUtility
 
-from tests import requires_test_environment, TestEnvironment
+from tests import requires_test_environment, TestEnvironment, OPENSSL
 
 
 class TestDiagnostics(unittest.TestCase):
@@ -86,15 +86,25 @@ class TestDiagnosticsLive(unittest.TestCase):
 		if self.server is not None:
 			self.stop_server()
 
-	def start_server(self, opts: Optional[List[str]] = None):
+	def start_server(
+		self,
+		tls_version: Optional[ats.TlsVersion] = None,
+		opts: Optional[List[str]] = None,
+	):
 		assert self.server is None
 
 		if opts is None:
 			opts = []
 
+		if tls_version is not None:
+			if tls_version is ats.TlsVersion.TLSv1_0:
+				opts.append('-tls1')
+			else:
+				opts.append(f'-tls1_{tls_version.value}')
+
 		self.server = subprocess.Popen(
 			[
-				'openssl', 's_server', '-www',
+				OPENSSL, 's_server', '-www',
 				'-accept', str(self.port),
 				'-key', str(self.key_path),
 				'-cert', str(self.certificate_path),
@@ -130,38 +140,57 @@ class TestDiagnosticsLive(unittest.TestCase):
 		return f'https://localhost:{self.port}'
 
 	@requires_test_environment
-	def test_default(self):
-		self.start_server(['-tls1_2'])
+	def test_default_with_tls_versions(self):
+		"""
+		Test default ATS configuration with different TLS versions.
+
+		The default ATS configuration should succeed to connect to a server with
+		TLSv1.2 or TLSv1.3 support, using modern ciphers with PFS and keys of
+		sufficient size. Previous TLS versions should be rejected by ATS.
+		"""
+
+		test_data: List[Tuple[ats.TlsVersion, bool]] = [
+			# (tls_version: ats.TlsVersion, is_positive: bool)
+			(ats.TlsVersion.TLSv1_0, False),
+			(ats.TlsVersion.TLSv1_1, False),
+			(ats.TlsVersion.TLSv1_2, True),
+
+			# FIXME Will fail on older versions of macOS
+			#(ats.TlsVersion.TLSv1_3, True),
+		]
+
 		atsdiag = self.compile_helper()
 
-		diagnostics_list = atsdiag.run({self.url})
+		for tls_version, is_positive in test_data:
+			with self.subTest(tls_version=str(tls_version), is_positive=is_positive):
 
-		self.assertEqual(len(diagnostics_list), 1)
+				self.start_server(tls_version=tls_version)
 
-		diagnostics = diagnostics_list[0]
+				diagnostics_list = atsdiag.run({self.url})
 
-		self.assertIn('url', diagnostics)
-		self.assertEqual(diagnostics['url'], self.url)
+				self.assertEqual(len(diagnostics_list), 1)
 
-		self.assertIn('timestamp', diagnostics)
-		self.assertNotIn('error', diagnostics)
+				diagnostics = diagnostics_list[0]
 
-	@requires_test_environment
-	def test_default_tlsv1_1(self):
-		self.start_server(['-tls1_1'])
-		atsdiag = self.compile_helper()
+				self.assertIn('url', diagnostics)
+				self.assertEqual(diagnostics['url'], self.url)
 
-		diagnostics_list = atsdiag.run({self.url})
+				self.assertIn('timestamp', diagnostics)
 
-		self.assertEqual(len(diagnostics_list), 1)
+				if is_positive:
+					self.assertNotIn('error', diagnostics)
+				else:
+					self.assertIn('error', diagnostics)
 
-		diagnostics = diagnostics_list[0]
+					error = diagnostics['error']
 
-		self.assertIn('url', diagnostics)
-		self.assertEqual(diagnostics['url'], self.url)
+					self.assertIn('code', error)
 
-		self.assertIn('timestamp', diagnostics)
-		self.assertIn('error', diagnostics)
+					code = error['code']
+
+					self.assertEqual(code, ats.ErrorCodes.SSLError)
+
+				self.stop_server()
 
 
 if __name__ == '__main__':
