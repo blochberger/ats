@@ -3,6 +3,7 @@ import plistlib
 import sys
 import tempfile
 
+from dataclasses import dataclass
 from pathlib import Path
 from time import sleep
 from typing import Any, Dict, List, Optional
@@ -36,16 +37,17 @@ class CodesigningIdentityParam(click.ParamType):
 			self.fail(f"Invalid codesigning identity: {value}")
 
 
+@dataclass(frozen=True)
+class Context:
+	identity: CodesigningIdentity
+
+
 @click.group()
-def cli():
-	pass
-
-
-@cli.command()
 @click.option(
 	'--codesigning-identity',
 	type=CodesigningIdentityParam(),
 	default='auto',
+	envvar="CODESIGN_IDENTITY",
 	show_default=True,
 	help="""
 	The SHA-1 hash of the identity used for signing code.
@@ -56,9 +58,16 @@ def cli():
 	Set to 'auto' in order to determine the codesigning identity automatically.
 	""",
 )
-def compile(
-	codesigning_identity: CodesigningIdentity,
-):
+@click.pass_context
+def cli(ctx: click.Context, codesigning_identity: CodesigningIdentity):
+	ctx.obj = Context(
+		identity=codesigning_identity,
+	)
+
+
+@cli.command()
+@click.pass_obj
+def compile(ctx: Context):
 	"""
 	Compile the `atsdiag` and `plsan` helper utilities.
 	"""
@@ -67,7 +76,7 @@ def compile(
 
 	with tqdm(
 		desc="Compiling utilities",
-		total=len(utility_classes) * 2,
+		total=len(utility_classes) * 2,  # Compile and sign each utility
 		leave=False,
 	) as progress:
 		utilities: List[Utility] = []
@@ -80,7 +89,7 @@ def compile(
 			for utility in to_process:
 				state = utility.poll()
 				if state is State.Compiled:
-					utility.start_signing(identity=codesigning_identity)
+					utility.start_signing(ctx.identity)
 				if state in {State.Compiled, State.Ready}:
 					progress.update()
 			sleep(.1)
@@ -89,27 +98,14 @@ def compile(
 
 @cli.command()
 @click.option(
-	'--codesigning-identity',
-	type=CodesigningIdentityParam(),
-	default='auto',
-	show_default=True,
-	help="""
-	The SHA-1 hash of the identity used for signing code.
-	All valid identities can be listed with:
-
-		security find-identity -p codesigning -v
-
-	Set to 'auto' in order to determine the codesigning identity automatically.
-	""",
-)
-@click.option(
 	'--skip-tlsv1_3/--no-skip-tlsv1_3',
 	default=True,
 	show_default=True
 )
 @click.argument('url_', metavar='URL', required=True)
+@click.pass_obj
 def diagnose(
-	codesigning_identity: CodesigningIdentity,
+	ctx: Context,
 	skip_tlsv1_3: bool,
 	url_: str,
 ):
@@ -117,11 +113,7 @@ def diagnose(
 	domain = url.hostname
 
 	if domain is None:
-		click.BadArgumentUsage(f"Invalid URL: {url_}")
-	assert domain is not None
-
-	with ats.DiagnoseUtility.default_info_plist_path().open('rb') as fp:
-		info_plist = plistlib.load(fp)
+		raise click.BadArgumentUsage(f"Invalid URL: {url_}")
 
 	configuration: Optional[ats.Configuration] = ats.Configuration.MostSecure
 
@@ -129,26 +121,18 @@ def diagnose(
 	if skip_tlsv1_3 and configuration.tls_version is ats.TlsVersion.TLSv1_3:
 		configuration = configuration.with_tls_version(ats.TlsVersion.TLSv1_2)
 
-	while configuration:
+	while configuration is not None:
 		with tempfile.TemporaryDirectory(prefix='ats-') as temp_dir_:
 			temp_dir = Path(temp_dir_)
 
 			target_path = temp_dir / f'atsdiag-{str(configuration)}'
-			info_plist_path = temp_dir / 'atsdiag-{str(configuration)}.plist'
-
-			info_plist['NSAppTransportSecurity'] = configuration.ats_dict(
-				{domain},
-				simplify=False,
-			)
-
-			with info_plist_path.open('wb') as fp:
-				plistlib.dump(info_plist, fp, fmt=plistlib.FMT_XML)
 
 			click.secho(f"Compiling {target_path}... ", nl=False, err=True)
-			atsdiag = ats.DiagnoseUtility.compile_and_sign(
+			atsdiag = ats.DiagnoseUtility.compile_and_sign_with(
+				ats_configuration=configuration,
+				exception_domains={domain},
 				target_path=target_path,
-				info_plist_path=info_plist_path,
-				identity=codesigning_identity,
+				identity=ctx.identity,
 			)
 			click.secho("✓", fg='green', bold=True, err=True)
 
