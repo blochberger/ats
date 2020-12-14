@@ -19,6 +19,11 @@ setup(
 		'click',
 		'tqdm',
 	],
+	extras_require=dict(
+		test=[
+			'ddt',
+		],
+	),
 	entry_points=dict(
 		console_scripts=[
 			'ats=main:cli',

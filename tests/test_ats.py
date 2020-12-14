@@ -6,8 +6,10 @@ import unittest
 
 from pathlib import Path
 from time import sleep
-from typing import List, Optional, Tuple
+from typing import List, Optional
 from random import randint
+
+import ddt
 
 import ats
 
@@ -53,6 +55,7 @@ class TestDiagnostics(unittest.TestCase):
 		self.assertEqual(error['code'], ats.ErrorCodes.DomainNotFound)
 
 
+@ddt.ddt
 class TestDiagnosticsLive(unittest.TestCase):
 
 	@property
@@ -131,10 +134,15 @@ class TestDiagnosticsLive(unittest.TestCase):
 
 		self.server = None
 
-	def compile_helper(self) -> ats.DiagnoseUtility:
+	def compile_helper(
+		self,
+		ats_configuration: ats.Configuration,
+	) -> ats.DiagnoseUtility:
 		target_path = self.temp_dir / 'atsdiag'
 
-		atsdiag = ats.DiagnoseUtility.compile_and_sign(
+		atsdiag = ats.DiagnoseUtility.compile_and_sign_with(
+			ats_configuration=ats_configuration,
+			exception_domains={'localhost'},
 			target_path=target_path,
 		)
 
@@ -142,57 +150,64 @@ class TestDiagnosticsLive(unittest.TestCase):
 
 	@property
 	def url(self) -> str:
-		return f'https://localhost:{self.port}'
+		return f'https://localhost:{self.port}/'
 
 	@requires_test_environment
-	def test_default_with_tls_versions(self):
+	@ddt.data(
+		(ats.Configuration.Default, ats.TlsVersion.TLSv1_0, False),
+		(ats.Configuration.Default, ats.TlsVersion.TLSv1_1, False),
+		(ats.Configuration.Default, ats.TlsVersion.TLSv1_2, True),
+		(ats.Configuration.Default, ats.TlsVersion.TLSv1_3, True),
+		(
+			ats.Configuration.Default.with_tls_version(ats.TlsVersion.TLSv1_3),
+			ats.TlsVersion.TLSv1_3,
+			True,
+		),
+		(
+			ats.Configuration.Default.with_tls_version(ats.TlsVersion.TLSv1_3),
+			ats.TlsVersion.TLSv1_2,
+			False,
+		),
+		(ats.Configuration.MostSecure, ats.TlsVersion.TLSv1_3, False),
+	)
+	@ddt.unpack
+	def test_tls_versions(
+		self,
+		configuration: ats.Configuration,
+		tls_version: ats.TlsVersion,
+		is_positive: bool,
+	):
 		"""
-		Test default ATS configuration with different TLS versions.
-
-		The default ATS configuration should succeed to connect to a server with
-		TLSv1.2 or TLSv1.3 support, using modern ciphers with PFS and keys of
-		sufficient size. Previous TLS versions should be rejected by ATS.
+		Test ATS configurations with different TLS versions.
 		"""
 
-		test_data: List[Tuple[ats.TlsVersion, bool]] = [
-			(ats.TlsVersion.TLSv1_0, False),
-			(ats.TlsVersion.TLSv1_1, False),
-			(ats.TlsVersion.TLSv1_2, True),
-			(ats.TlsVersion.TLSv1_3, True),
-		]
+		self.start_server(tls_version=tls_version)
 
-		atsdiag = self.compile_helper()  # Uses default ATS configuration
+		atsdiag = self.compile_helper(configuration)
 
-		for tls_version, is_positive in test_data:
-			with self.subTest(tls_version=str(tls_version), is_positive=is_positive):
+		diagnostics_list = atsdiag.run({self.url})
 
-				self.start_server(tls_version=tls_version)
+		self.assertEqual(len(diagnostics_list), 1)
 
-				diagnostics_list = atsdiag.run({self.url})
+		diagnostics = diagnostics_list[0]
 
-				self.assertEqual(len(diagnostics_list), 1)
+		self.assertIn('url', diagnostics)
+		self.assertEqual(diagnostics['url'], self.url)
 
-				diagnostics = diagnostics_list[0]
+		self.assertIn('timestamp', diagnostics)
 
-				self.assertIn('url', diagnostics)
-				self.assertEqual(diagnostics['url'], self.url)
+		if is_positive:
+			self.assertNotIn('error', diagnostics)
+		else:
+			self.assertIn('error', diagnostics)
 
-				self.assertIn('timestamp', diagnostics)
+			error = diagnostics['error']
 
-				if is_positive:
-					self.assertNotIn('error', diagnostics)
-				else:
-					self.assertIn('error', diagnostics)
+			self.assertIn('code', error)
 
-					error = diagnostics['error']
+			code = error['code']
 
-					self.assertIn('code', error)
-
-					code = error['code']
-
-					self.assertEqual(code, ats.ErrorCodes.SSLError)
-
-				self.stop_server()
+			self.assertEqual(code, ats.ErrorCodes.SSLError)
 
 
 if __name__ == '__main__':
