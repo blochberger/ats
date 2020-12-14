@@ -66,28 +66,41 @@ class TestEnvironment:
 
 	@classmethod
 	def create_server_certificate(cls, key_path: Path, certificate_path: Path):
-		with tempfile.NamedTemporaryFile() as csr:
+		exts = [
+			'extendedKeyUsage=serverAuth',
+			'subjectAltName=DNS:localhost',
+		]
+
+		with tempfile.TemporaryDirectory() as temp_dir:
+			temp_path = Path(temp_dir)
+
+			csr_path = temp_path / 'csr.pem'
+			ext_path = temp_path / 'ext.cfg'
+
 			# Create certificate request
 			subprocess.run(
 				[
 					OPENSSL, 'req', '-new', '-nodes',
 					'-newkey', 'rsa:2048',
 					'-keyout', str(key_path),
-					'-out', csr.name,
-					'-subj', f'/O={cls.__name__}/CN=localhost'	,
+					'-out', str(csr_path),
+					'-subj', f'/O={cls.__name__}/CN=localhost',
 				],
 				check=True,
 				capture_output=True,
 			)
 
+			ext_path.write_text('\n'.join(exts))
+
 			# Sign certificate request with CA
 			subprocess.run(
 				[
 					OPENSSL, 'x509', '-req',
-					'-in', csr.name,
+					'-in', str(csr_path),
 					'-CA', str(cls.ca_certificate_path()),
 					'-CAkey', str(cls.ca_key_path()),
 					'-CAcreateserial',
+					'-extfile', str(ext_path),
 					'-out', str(certificate_path),
 					'-days', '1',
 				],

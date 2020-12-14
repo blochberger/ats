@@ -150,9 +150,7 @@ class TestDiagnosticsLive(unittest.TestCase):
 			(ats.TlsVersion.TLSv1_0, False),
 			(ats.TlsVersion.TLSv1_1, False),
 			(ats.TlsVersion.TLSv1_2, True),
-
-			# FIXME Will fail on older versions of macOS
-			#(ats.TlsVersion.TLSv1_3, True),
+			(ats.TlsVersion.TLSv1_3, True),
 		]
 
 		atsdiag = self.compile_helper()  # Uses default ATS configuration
