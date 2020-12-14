@@ -104,24 +104,19 @@ func echo(_ text: String, err: Bool = false, end: String? = "\n") {
 }
 
 func main() -> ExitCode {
-	let tlsv1_3SupportOpt = "--enable-tlsv1_3"
-	let tlsv1_3Support = CommandLine.arguments.contains(tlsv1_3SupportOpt)
-
 	let printContentOpt = "--print-content"
 	let printContent = CommandLine.arguments.contains(printContentOpt)
 
 	var requiredArgs = 1
-	if tlsv1_3Support { requiredArgs += 1 }
 	if printContent { requiredArgs += 1 }
 
 	guard requiredArgs < CommandLine.arguments.count else {
-		echo("Usage: \(CommandLine.arguments[0]) [\(tlsv1_3SupportOpt)] [\(printContentOpt)] URL...", err: true)
+		echo("Usage: \(CommandLine.arguments[0]) [\(printContentOpt)] URL...", err: true)
 		return .failure
 	}
 
 	var urls: Set<URL> = []
 	for argument in CommandLine.arguments[1...] {
-		guard argument != tlsv1_3SupportOpt else { continue }
 		guard argument != printContentOpt else { continue }
 		guard let url = URL(string: argument) else {
 			echo("Invalid URL: \(argument)", err: true)
@@ -143,14 +138,7 @@ func main() -> ExitCode {
 	let concurrentTasks = 8
 	let outputSemaphore = DispatchSemaphore(value: concurrentTasks)
 
-	let configuration = URLSessionConfiguration.ephemeral
-
-	if tlsv1_3Support {
-		// Enable TLSv1.3 support
-		configuration.tlsMaximumSupportedProtocol = .tlsProtocol13
-	}
-
-	let session = URLSession(configuration: configuration)
+	let session = URLSession(configuration: .ephemeral)
 
 	let encoder = JSONEncoder()
 	var exitCode: ExitCode = .success
