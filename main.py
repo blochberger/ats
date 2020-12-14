@@ -97,18 +97,9 @@ def compile(ctx: Context):
 
 
 @cli.command()
-@click.option(
-	'--skip-tlsv1_3/--no-skip-tlsv1_3',
-	default=True,
-	show_default=True
-)
 @click.argument('url_', metavar='URL', required=True)
 @click.pass_obj
-def diagnose(
-	ctx: Context,
-	skip_tlsv1_3: bool,
-	url_: str,
-):
+def diagnose(ctx: Context, url_: str):
 	url = urlparse(url_)
 	domain = url.hostname
 
@@ -116,10 +107,6 @@ def diagnose(
 		raise click.BadArgumentUsage(f"Invalid URL: {url_}")
 
 	configuration: Optional[ats.Configuration] = ats.Configuration.MostSecure
-
-	assert configuration is not None
-	if skip_tlsv1_3 and configuration.tls_version is ats.TlsVersion.TLSv1_3:
-		configuration = configuration.with_tls_version(ats.TlsVersion.TLSv1_2)
 
 	while configuration is not None:
 		with tempfile.TemporaryDirectory(prefix='ats-') as temp_dir_:
