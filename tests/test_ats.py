@@ -98,6 +98,14 @@ class TestDiagnosticsLive(unittest.TestCase):
 				opts.append('-tls1')
 			else:
 				opts.append(f'-tls1_{tls_version.value}')
+			if tls_version is ats.TlsVersion.TLSv1_2:
+				# Even when passing `-tls1_2` to `openssl s_server`, which is
+				# supposed to only enable TLSv1.2, connections via TLSv1.3 are
+				# still possible. Hence, setting the minimum required TLS
+				# version to TLSv1.3 will not fail. In order to actually enforce
+				# TLSv1.2, the TLSv1.3 cipher suites need to be disabled as
+				# well.
+				opts += ['-ciphersuites', '']
 
 		self.server = subprocess.Popen(
 			[
