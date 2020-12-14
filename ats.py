@@ -179,12 +179,13 @@ class DiagnoseUtility(Utility):
 		return 'atsdiag'
 
 	@classmethod
-	def start_compilation_with(
+	def compile_and_sign_with(
 		cls,
 		ats_configuration: Configuration,
 		exception_domains: Optional[Set[str]] = None,
 		target_path: Optional[Path] = None,
 		optimize: bool = True,
+		identity: Optional[CodesigningIdentity] = None,
 	) -> 'DiagnoseUtility':
 		if exception_domains is None:
 			exception_domains = set()
@@ -197,6 +198,7 @@ class DiagnoseUtility(Utility):
 			simplify=False,
 		)
 
+		# Compile
 		with tempfile.NamedTemporaryFile() as tmp:
 			tmp_path = Path(tmp.name)
 
@@ -208,26 +210,7 @@ class DiagnoseUtility(Utility):
 				optimize=optimize,
 				info_plist_path=tmp_path,
 			)
-
-		return atsdiag
-
-	@classmethod
-	def compile_and_sign_with(
-		cls,
-		ats_configuration: Configuration,
-		exception_domains: Optional[Set[str]] = None,
-		target_path: Optional[Path] = None,
-		optimize: bool = True,
-		identity: Optional[CodesigningIdentity] = None,
-	) -> 'DiagnoseUtility':
-		# Compile
-		atsdiag = cls.start_compilation_with(
-			ats_configuration=ats_configuration,
-			exception_domains=exception_domains,
-			target_path=target_path,
-			optimize=optimize,
-		)
-		atsdiag.wait()
+			atsdiag.wait()
 
 		assert atsdiag._state is State.Compiled
 
