@@ -1,0 +1,4 @@
+; @see https://flake8.readthedocs.io/en/latest/user/configuration.html
+[flake8]
+ignore =
+	W191, # indentation contains tabs
