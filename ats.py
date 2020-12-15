@@ -142,7 +142,7 @@ class Configuration(enum.IntFlag):
 
 		def maybe_set(d: Dict[str, Any], flag: 'Configuration'):
 			if not simplify or (flag in self) != (flag in cls.Default):
-					d[cls.ats_key(flag)] = flag in self
+				d[cls.ats_key(flag)] = flag in self
 
 		maybe_set(result, cls.AllowsArbitraryLoads)
 		maybe_set(result, cls.AllowsLocalNetworking)
