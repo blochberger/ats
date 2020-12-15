@@ -88,7 +88,7 @@ class TestDiagnosticsLive(unittest.TestCase):
 
 	def start_server(
 		self,
-		tls_version: Optional[ats.TlsVersion] = None,
+		maximum_tls_version: Optional[ats.TlsVersion] = None,
 		opts: Optional[List[str]] = None,
 	):
 		assert self.server is None
@@ -96,19 +96,11 @@ class TestDiagnosticsLive(unittest.TestCase):
 		if opts is None:
 			opts = []
 
-		if tls_version is not None:
-			if tls_version is ats.TlsVersion.TLSv1_0:
-				opts.append('-tls1')
-			else:
-				opts.append(f'-tls1_{tls_version.value}')
-			if tls_version is ats.TlsVersion.TLSv1_2:
-				# Even when passing `-tls1_2` to `openssl s_server`, which is
-				# supposed to only enable TLSv1.2, connections via TLSv1.3 are
-				# still possible. Hence, setting the minimum required TLS
-				# version to TLSv1.3 will not fail. In order to actually enforce
-				# TLSv1.2, the TLSv1.3 cipher suites need to be disabled as
-				# well.
-				opts += ['-ciphersuites', '']
+		if maximum_tls_version is not None:
+			max_protocol = str(maximum_tls_version)
+			if maximum_tls_version is ats.TlsVersion.TLSv1_0:
+				max_protocol = max_protocol[:-2]
+			opts += ['-max_protocol', max_protocol]
 
 		self.server = subprocess.Popen(
 			[
@@ -154,34 +146,32 @@ class TestDiagnosticsLive(unittest.TestCase):
 
 	@requires_test_environment
 	@ddt.data(
-		(ats.Configuration.Default, ats.TlsVersion.TLSv1_0, False),
-		(ats.Configuration.Default, ats.TlsVersion.TLSv1_1, False),
-		(ats.Configuration.Default, ats.TlsVersion.TLSv1_2, True),
-		(ats.Configuration.Default, ats.TlsVersion.TLSv1_3, True),
+		(ats.Configuration.Default, ats.TlsVersion.TLSv1_2, []),
+		(ats.Configuration.Default, ats.TlsVersion.TLSv1_3, []),
 		(
 			ats.Configuration.Default.with_tls_version(ats.TlsVersion.TLSv1_3),
 			ats.TlsVersion.TLSv1_3,
-			True,
+			[],
 		),
 		(
-			ats.Configuration.Default.with_tls_version(ats.TlsVersion.TLSv1_3),
+			ats.Configuration.Default & ~ats.Configuration.RequiresForwardSecrecy,
 			ats.TlsVersion.TLSv1_2,
-			False,
+			[],
 		),
-		(ats.Configuration.MostSecure, ats.TlsVersion.TLSv1_3, False),
+		(
+			ats.Configuration.Default & ~ats.Configuration.RequiresForwardSecrecy,
+			ats.TlsVersion.TLSv1_2,
+			['-no_dhe', '-cipher', 'AES256-GCM-SHA384'],  # disable FS
+		),
 	)
 	@ddt.unpack
-	def test_tls_versions(
+	def test_atsdiag_positive(
 		self,
 		configuration: ats.Configuration,
-		tls_version: ats.TlsVersion,
-		is_positive: bool,
+		maximum_tls_version: ats.TlsVersion,
+		server_opts: List[str],
 	):
-		"""
-		Test ATS configurations with different TLS versions.
-		"""
-
-		self.start_server(tls_version=tls_version)
+		self.start_server(maximum_tls_version=maximum_tls_version, opts=server_opts)
 
 		atsdiag = self.compile_helper(configuration)
 
@@ -196,18 +186,69 @@ class TestDiagnosticsLive(unittest.TestCase):
 
 		self.assertIn('timestamp', diagnostics)
 
-		if is_positive:
-			self.assertNotIn('error', diagnostics)
-		else:
-			self.assertIn('error', diagnostics)
+		self.assertNotIn('error', diagnostics)
 
-			error = diagnostics['error']
+	@requires_test_environment
+	@ddt.data(
+		(ats.Configuration.Default, ats.TlsVersion.TLSv1_0, -9836, []),
+		(ats.Configuration.Default, ats.TlsVersion.TLSv1_1, -9836, []),
+		(  # Test certificate is not in CT log
+			ats.Configuration.MostSecure, ats.TlsVersion.TLSv1_3, -9802, []),
+		(
+			ats.Configuration.Default.with_tls_version(ats.TlsVersion.TLSv1_3),
+			ats.TlsVersion.TLSv1_2,
+			-9836,
+			[],
+		),
+		(
+			ats.Configuration.Default,
+			ats.TlsVersion.TLSv1_2,  # PFS is enforced in TLSv1.3
+			-9824,
+			['-no_dhe', '-cipher', 'AES256-GCM-SHA384'],  # disable FS
+		),
+	)
+	@ddt.unpack
+	def test_atsdiag_negative(
+		self,
+		configuration: ats.Configuration,
+		maximum_tls_version: ats.TlsVersion,
+		error_code: int,  # FIXME
+		server_opts: List[str],
+	):
+		self.start_server(maximum_tls_version=maximum_tls_version, opts=server_opts)
 
-			self.assertIn('code', error)
+		atsdiag = self.compile_helper(configuration)
 
-			code = error['code']
+		diagnostics_list = atsdiag.run({self.url})
 
-			self.assertEqual(code, ats.ErrorCodes.SSLError)
+		self.assertEqual(len(diagnostics_list), 1)
+
+		diagnostics = diagnostics_list[0]
+
+		self.assertIn('url', diagnostics)
+		self.assertEqual(diagnostics['url'], self.url)
+
+		self.assertIn('timestamp', diagnostics)
+
+		self.assertIn('error', diagnostics)
+
+		error = diagnostics['error']
+
+		self.assertIn('code', error)
+
+		code = error['code']
+
+		self.assertEqual(code, ats.ErrorCodes.SSLError)
+
+		self.assertIn('userInfo', error)
+
+		user_info = error['userInfo']
+
+		self.assertIn('_kCFStreamErrorCodeKey', user_info)
+
+		stream_error_code = int(user_info['_kCFStreamErrorCodeKey'])
+
+		self.assertEqual(stream_error_code, error_code)
 
 
 if __name__ == '__main__':
