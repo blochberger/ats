@@ -1,5 +1,4 @@
 import json
-import plistlib
 import sys
 import tempfile
 
