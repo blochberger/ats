@@ -18,6 +18,13 @@ class ErrorCodes(enum.IntEnum):
 	ATSError = -1022
 	SSLError = -1200
 
+	# These codes were observed from test cases but might not reflect the actual
+	# underlying error appropriately.
+	# TODO Lookup error codes
+	NoCertificateTransparency = -9802
+	NoForwardSecrecy = -9824
+	InvalidTlsVersion = -9836
+
 
 @enum.unique
 class TlsVersion(enum.IntEnum):

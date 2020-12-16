@@ -190,20 +190,24 @@ class TestDiagnosticsLive(unittest.TestCase):
 
 	@requires_test_environment
 	@ddt.data(
-		(ats.Configuration.Default, ats.TlsVersion.TLSv1_0, -9836, []),
-		(ats.Configuration.Default, ats.TlsVersion.TLSv1_1, -9836, []),
+		(ats.Configuration.Default, ats.TlsVersion.TLSv1_0, ats.ErrorCodes.InvalidTlsVersion, []),
+		(ats.Configuration.Default, ats.TlsVersion.TLSv1_1, ats.ErrorCodes.InvalidTlsVersion, []),
 		(  # Test certificate is not in CT log
-			ats.Configuration.MostSecure, ats.TlsVersion.TLSv1_3, -9802, []),
+			ats.Configuration.MostSecure,
+			ats.TlsVersion.TLSv1_3,
+			ats.ErrorCodes.NoCertificateTransparency,
+			[],
+		),
 		(
 			ats.Configuration.Default.with_tls_version(ats.TlsVersion.TLSv1_3),
 			ats.TlsVersion.TLSv1_2,
-			-9836,
+			ats.ErrorCodes.InvalidTlsVersion,
 			[],
 		),
 		(
 			ats.Configuration.Default,
 			ats.TlsVersion.TLSv1_2,  # PFS is enforced in TLSv1.3
-			-9824,
+			ats.ErrorCodes.NoForwardSecrecy,
 			['-no_dhe', '-cipher', 'AES256-GCM-SHA384'],  # disable FS
 		),
 	)
@@ -212,7 +216,7 @@ class TestDiagnosticsLive(unittest.TestCase):
 		self,
 		configuration: ats.Configuration,
 		maximum_tls_version: ats.TlsVersion,
-		error_code: int,  # FIXME
+		error_code: ats.ErrorCodes,
 		server_opts: List[str],
 	):
 		self.start_server(maximum_tls_version=maximum_tls_version, opts=server_opts)
