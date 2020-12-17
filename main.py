@@ -186,9 +186,8 @@ def teardown():
 	"""
 	Removes the current test environment.
 
-	fail, see `setup` command for a more detailed descirptio
-
-	In detail:
+	Without a test environment, some tests will fail, see `setup` command for
+	a more detailed description.
 	"""
 
 	if not TestEnvironment.exists():
