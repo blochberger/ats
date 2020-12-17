@@ -1,11 +1,9 @@
 import json
 import sys
-import tempfile
 
 from dataclasses import dataclass
-from pathlib import Path
 from time import sleep
-from typing import Any, Dict, List, Optional
+from typing import Any, List, Optional
 from urllib.parse import urlparse
 
 import click
@@ -98,80 +96,35 @@ def compile(ctx: Context):
 @cli.command()
 @click.argument('url_', metavar='URL', required=True)
 @click.pass_obj
-def diagnose(ctx: Context, url_: str):
-	url = urlparse(url_)
-	domain = url.hostname
+def determine(ctx: Context, url_: str):
 
-	if domain is None:
-		raise click.BadArgumentUsage(f"Invalid URL: {url_}")
+	def log_info(msg: str, nl: bool = True):
+		click.secho(msg, nl=nl, err=True)
 
-	configuration: Optional[ats.Configuration] = ats.Configuration.MostSecure
+	def log_error(msg: str, nl: bool = True):
+		click.secho(msg, fg='red', nl=nl, err=True)
 
-	while configuration is not None:
-		with tempfile.TemporaryDirectory(prefix='ats-') as temp_dir_:
-			temp_dir = Path(temp_dir_)
+	def log_success(msg: str, nl: bool = True):
+		click.secho(msg, fg='green', nl=nl, err=True)
 
-			target_path = temp_dir / f'atsdiag-{str(configuration)}'
+	def log_special(msg: str, nl: bool = True):
+		click.secho(msg, fg='blue', nl=nl, err=True)
 
-			click.secho(f"Compiling {target_path}... ", nl=False, err=True)
-			atsdiag = ats.DiagnoseUtility.compile_and_sign_with(
-				ats_configuration=configuration,
-				exception_domains={domain},
-				target_path=target_path,
-				identity=ctx.identity,
-			)
-			click.secho("✓", fg='green', bold=True, err=True)
+	url = ats.Url.from_url(url_)
 
-			click.secho("Trying configuration ", nl=False, err=True)
-			click.secho(str(configuration), bold=True, nl=False, err=True)
-			click.secho("... ", nl=False, err=True)
-			diagnostics = atsdiag.run({url.geturl()})[0]
-			error: Dict[str, Any] = diagnostics.get('error', dict())
+	if url is None:
+		raise click.BadOptionUsage('url', f"Invalid URL: {url}")
 
-			if not error:
-				click.secho("✓", fg='green', bold=True, err=True)
-				diagnostics['ats'] = configuration.ats_dict({domain}, simplify=True)
-				click.echo(json.dumps(diagnostics))
-				return
+	result = ats.find_best_configuration(
+		url=url,
+		identity=ctx.identity,
+		log_info=log_info,
+		log_error=log_error,
+		log_success=log_success,
+		log_special=log_special,
+	)
 
-			click.secho("× ", fg='red', bold=True, err=True, nl=False)
-
-			# TODO Detect local domains?
-
-			# TODO Check whether URL has HTTP scheme
-			# - try upgrading to HTTPS (check for redirect or simply modify scheme)
-			# - try AllowsInsecureHttpLoads as fallback or alternative?
-
-			code = error.get('code', None)
-
-			if code == ats.ErrorCodes.SSLError:
-				tls_version = configuration.tls_version
-				if ats.TlsVersion.TLSv1_0 < tls_version:
-					new_tls_version = ats.TlsVersion(tls_version - 1)
-					click.secho(f"Decreasing required TLS version: {new_tls_version}", err=True)
-					configuration = configuration.with_tls_version(new_tls_version)
-					continue
-
-			if code == ats.ErrorCodes.DomainNotFound:
-				# TODO Try with AllowsLocalNetworking
-				# - still use MostSecure? or is anything allowed locally?
-				# - if the host is still not found, mark it as finished
-				pass
-
-			if code == ats.ErrorCodes.ATSError:
-				# TODO Disable CT, if enabled
-				# TODO Enable CT and disable FS, if enabled
-				# TODO Disable FS and CT
-				# TODO Try AllowsArbitraryLoads
-				pass
-
-			click.secho("unhandled", fg='red', err=True)
-			results = {
-				'ats': configuration.ats_dict({domain}, simplify=False),
-				'diagnostics': diagnostics,
-			}
-			click.echo(json.dumps(results))
-			configuration = None
+	click.echo(json.dumps(result))
 
 
 @cli.group()

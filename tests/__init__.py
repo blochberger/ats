@@ -3,6 +3,7 @@ import tempfile
 import unittest
 
 from pathlib import Path
+from typing import List, Optional
 
 
 OPENSSL = '/usr/local/opt/openssl/bin/openssl'
@@ -65,10 +66,18 @@ class TestEnvironment:
 		return line[-40:]
 
 	@classmethod
-	def create_server_certificate(cls, key_path: Path, certificate_path: Path):
+	def create_server_certificate(
+		cls,
+		key_path: Path,
+		certificate_path: Path,
+		subjectAltNames: Optional[List[str]] = None,
+	):
+		if subjectAltNames is None:
+			subjectAltNames = ['DNS:localhost']
+
 		exts = [
 			'extendedKeyUsage=serverAuth',
-			'subjectAltName=DNS:localhost',
+			f'subjectAltName={",".join(subjectAltNames)}',
 		]
 
 		with tempfile.TemporaryDirectory() as temp_dir:
@@ -84,7 +93,7 @@ class TestEnvironment:
 					'-newkey', 'rsa:2048',
 					'-keyout', str(key_path),
 					'-out', str(csr_path),
-					'-subj', f'/O={cls.__name__}/CN=localhost',
+					'-subj', f'/O={cls.__name__}',
 				],
 				check=True,
 				capture_output=True,

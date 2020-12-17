@@ -6,24 +6,80 @@ import subprocess
 import tempfile
 
 from dataclasses import dataclass
+from ipaddress import ip_address
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Set
+from urllib.parse import urlparse
+from typing_extensions import Protocol
 
 from utilities import CodesigningIdentity, State, Utility
+
+
+class LogFunc(Protocol):
+
+	def __call__(self, msg: str, nl: bool = True): ...
+
+
+def no_log(msg: str, nl: bool = True):
+	pass
 
 
 @enum.unique
 class ErrorCodes(enum.IntEnum):
 	DomainNotFound = -1003
+
+	CouldNotConnect = -1004
+	"""
+	- Server not running
+	"""
+
+	NetworkConnectionLost = -1005
+	"""
+	- Trying to connect without TLS to a TLS server
+	"""
+
 	ATSError = -1022
+	"""
+	- Occurs for HTTP, even if the URL would redirect to HTTPS
+	"""
+
 	SSLError = -1200
 
-	# These codes were observed from test cases but might not reflect the actual
-	# underlying error appropriately.
+	# The codes below were observed from test cases but might not reflect the
+	# actual underlying error appropriately.
 	# TODO Lookup error codes
+
 	NoCertificateTransparency = -9802
+	"""
+	SSLError
+	- Certificate is not in at least two of Apple-trusted CT logs
+	"""
+
 	NoForwardSecrecy = -9824
-	InvalidTlsVersion = -9836
+	"""
+	SSLError
+	- Connection is not forward secure
+	"""
+
+	TlsError = -9836
+	"""
+	SSLError
+	- Invalid TLS version
+	- No common ciphers
+	- Incorrect subjectAltName?
+	"""
+
+	DeprecatedSSL = -9838  # SSLv3
+	"""
+	SSLError
+	- SSLv3
+	"""
+
+	InvalidSubjectAltName = -9843
+	"""
+	SSLError
+	- Invalid subjectAltName
+	"""
 
 
 @enum.unique
@@ -43,6 +99,51 @@ class TlsVersion(enum.IntEnum):
 		if not m:
 			raise ValueError(f"Invalid TlsVersion: {value}")
 		return cls(int(m.group(1)))
+
+
+@dataclass(frozen=True)
+class Url:
+	value: str
+
+	@property
+	def hostname(self) -> str:
+		hostname = urlparse(self.value).hostname
+		assert hostname is not None
+		return hostname
+
+	@property
+	def is_local(self) -> bool:
+		return '.' not in self.hostname or self.hostname.endswith('.local')
+
+	@property
+	def is_ip(self) -> bool:
+		try:
+			ip_address(self.hostname)
+		except ValueError:
+			return False
+		return True
+
+	@property
+	def is_http(self) -> bool:
+		return urlparse(self.value).scheme == 'http'
+
+	@property
+	def with_https(self) -> 'Url':
+		if self.is_http:
+			return self.__class__('https' + self.value[4:])
+		return self
+
+	def __str__(self) -> str:
+		return self.value
+
+	@classmethod
+	def from_url(cls, url: str) -> Optional['Url']:
+		parsed = urlparse(url)
+		if parsed.hostname is None:
+			return None
+		if parsed.scheme not in {'http', 'https'}:
+			return None
+		return cls(url)
 
 
 class Configuration(enum.IntFlag):
@@ -133,7 +234,30 @@ class Configuration(enum.IntFlag):
 		}[flag]
 
 	def __str__(self) -> str:
-		return f'{self.value:02X}'
+		cls = self.__class__
+
+		flags: List[str] = []
+		if cls.AllowsArbitraryLoads in self:
+			flags.append("ArbitaryLoads")
+		if cls.AllowsLocalNetworking in self:
+			flags.append("LocalNetworking")
+		if cls.AllowsInsecureHttpLoads in self:
+			flags.append("InsecureHTTPLoads")
+		if cls.RequiresForwardSecrecy in self:
+			flags.append("FS")
+		if cls.RequiresCertificateTransparency in self:
+			flags.append("CT")
+		flags.append(str(self.tls_version))
+
+		result = '+'.join(flags)
+
+		if self is cls.MostSecure:
+			result += '=MostSecure'
+
+		if self is cls.Default:
+			result += '=Default'
+
+		return result
 
 	def ats_dict(
 		self,
@@ -229,11 +353,11 @@ class DiagnoseUtility(Utility):
 
 		return atsdiag
 
-	def start(self, urls: Set[str]):
+	def start(self, urls: Set[Url]):
 		assert self.is_ready
 
 		intermediate = subprocess.Popen(
-			[str(self.path)] + list(urls),
+			[str(self.path)] + list({str(url) for url in urls}),
 			stdout=subprocess.PIPE,
 			stderr=subprocess.PIPE,
 			text=True,
@@ -253,10 +377,168 @@ class DiagnoseUtility(Utility):
 		self._finalize()
 		return results
 
-	def run(self, urls: Set[str]) -> List[Dict[str, Any]]:
+	def run(self, urls: Set[Url]) -> List[Dict[str, Any]]:
 		self.start(urls)
 		self.wait()
 
 		assert self.is_finished
 
 		return self.take_results()
+
+
+def find_best_configuration(
+	url: Url,
+	identity: Optional[CodesigningIdentity] = None,
+	upgrade_scheme: bool = False,
+	log_info: LogFunc = no_log,
+	log_error: LogFunc = no_log,
+	log_success: LogFunc = no_log,
+	log_special: LogFunc = no_log,
+) -> Optional[Dict[str, Any]]:
+	log_info(f"URL: {url} ", nl=False)
+
+	# Ignore IPv4 and IPv6 addresses
+	if url.is_ip:
+		log_success("✓ Connections to IP addresses are ignored by ATS")
+		return None
+
+	# HTTP -> HTTPS
+	if upgrade_scheme and url.is_http:
+		log_error("× No TLS")
+		log_special("  → ", nl=False)
+		new_url = url.with_https
+		log_info(f"Upgrading scheme to HTTPS: {new_url}")
+		return find_best_configuration(
+			url=new_url,
+			identity=identity,
+			log_info=log_info,
+			log_error=log_error,
+			log_success=log_success,
+			log_special=log_special,
+		)
+	log_success("✓")
+
+	configuration: Configuration = Configuration.MostSecure
+	exception_domains = {url.hostname}
+
+	while configuration != 0:
+		with tempfile.TemporaryDirectory(prefix='ats-') as temp_dir_:
+			temp_dir = Path(temp_dir_)
+
+			target_path = temp_dir / f'atsdiag-{str(configuration)}'
+
+			log_info(f"Configuration {str(configuration)}")
+			log_special("  · ", nl=False)
+			log_info("Compiling helper... ", nl=False)
+			atsdiag = DiagnoseUtility.compile_and_sign_with(
+				ats_configuration=configuration,
+				exception_domains=exception_domains,
+				target_path=target_path,
+				identity=identity,
+			)
+			log_success("✓")
+
+			log_special("  · ", nl=False)
+			log_info("Connecting... ", nl=False)
+			diagnostics = atsdiag.run({url})[0]
+			error: Dict[str, Any] = diagnostics.get('error', dict())
+
+			if not error:
+				log_success("✓")
+				return configuration.ats_dict(exception_domains, simplify=True)
+
+			log_error("× ", nl=False)
+
+			code = error.get('code', None)
+
+			if code == ErrorCodes.DomainNotFound:
+				log_error("DomainNotFound")
+				# TODO Mark URL as finished
+			elif code == ErrorCodes.CouldNotConnect:
+				log_error("CouldNotConnect")
+				# TODO Mark URL as finsihed
+			elif code == ErrorCodes.SSLError:
+				log_error("SSLError: ", nl=False)
+				ssl_error = int(error.get('userInfo', dict()).get('_kCFStreamErrorCodeKey', None))
+				if ssl_error == ErrorCodes.TlsError:
+					log_error("TLSError")
+					tls_version = configuration.tls_version
+					if TlsVersion.TLSv1_0 < tls_version:
+						new_tls_version = TlsVersion(tls_version - 1)
+						log_special("  → ", nl=False)
+						log_info(f"Decreasing required TLS version to {new_tls_version}")
+						configuration = configuration.with_tls_version(new_tls_version)
+						continue
+					else:
+						# Occurs f. e. if trying to connect with TLS to a
+						# non-TLS server.
+						if not url.is_http:
+							# TODO Try arbitrary loads?
+							log_error("Are you trying to establish a TLS connection to a server that does not support TLS?")
+							return None
+						# TODO Can this occur?
+						log_error("UNHANDLED")
+				elif ssl_error == ErrorCodes.NoCertificateTransparency:
+					log_error("NoCertificateTransparency")
+					if Configuration.RequiresCertificateTransparency in configuration:
+						log_special("  → ", nl=False)
+						log_info("Disabling requirement for certificate transparency")
+						configuration &= ~Configuration.RequiresCertificateTransparency
+						continue
+					else:
+						# TODO Can this occur?
+						log_error("UNHANDLED")
+				elif ssl_error == ErrorCodes.NoForwardSecrecy:
+					log_error("NoForwardSecrecy")
+					if Configuration.RequiresForwardSecrecy in configuration:
+						log_special("  → ", nl=False)
+						log_info("Disabling requirement for forward secrecy")
+						configuration &= ~Configuration.RequiresForwardSecrecy
+						continue
+					else:
+						# TODO Can this occur?
+						log_error("UNHANDLED")
+				elif ssl_error == ErrorCodes.DeprecatedSSL:
+					log_error("DeprecatedSSL")
+					# TODO Can there be other reasons for this to occur?
+					# TODO Mark URL as finished
+				else:
+					log_error(f"Unhandled SSL error code: {ssl_error}")
+			elif code == ErrorCodes.ATSError:
+				log_error("ATSError: ", nl=False)
+				if url.is_http:
+					log_error("No TLS")
+					assert not upgrade_scheme
+
+					log_special("  → ", nl=False)
+					log_info("Allowing insecure HTTP loads")
+					# TODO The best configuration for HTTPS-URLs of the same
+					# domain still need to be determined.
+					configuration = Configuration.Default | Configuration.AllowsInsecureHttpLoads
+					continue
+
+				if url.is_local:
+					log_error("Local domain")
+					log_special("  → ", nl=False)
+					log_info("Allowing local networking")
+					configuration = Configuration.AllowsLocalNetworking
+					exception_domains = set()
+					continue
+
+				assert Configuration.AllowsArbitraryLoads not in configuration
+
+				log_error("Unknown error")
+				log_special("  → ", nl=False)
+				log_info("Disabling ATS")
+				configuration = Configuration.AllowsArbitraryLoads
+				exception_domains = set()
+				continue
+			else:
+				log_error(f"Unhandled error code: {code}")
+
+			return dict(
+				ats=configuration.ats_dict(exception_domains, simplify=True),
+				diagnostics=diagnostics,
+			)
+
+	assert False, "Should not be reached."
