@@ -4,7 +4,6 @@ import sys
 from dataclasses import dataclass
 from time import sleep
 from typing import Any, List, Optional
-from urllib.parse import urlparse
 
 import click
 
