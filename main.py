@@ -2,12 +2,15 @@ import json
 import sys
 
 from dataclasses import dataclass
+from pathlib import Path
+from io import TextIOWrapper
 from time import sleep
-from typing import Any, List, Optional
+from typing import Any, List, Optional, Set
 
 import click
 
 from tqdm import tqdm
+from tqdm._utils import _term_move_up as term_move_up
 
 import ats
 from utilities import (
@@ -17,6 +20,9 @@ from utilities import (
 	Utility,
 )
 from tests import TestEnvironment
+
+
+_tqdm_buf = ''
 
 
 class CodesigningIdentityParam(click.ParamType):
@@ -65,7 +71,7 @@ def cli(ctx: click.Context, codesigning_identity: CodesigningIdentity):
 @click.pass_obj
 def compile(ctx: Context):
 	"""
-	Compile the `atsdiag` and `plsan` helper utilities.
+	Compile the `atsprobe` and `plsan` helper utilities.
 	"""
 
 	utility_classes = [ats.DiagnoseUtility, PlistSanitizer]
@@ -93,9 +99,10 @@ def compile(ctx: Context):
 
 
 @cli.command()
+@click.option('--upgrade-scheme/--no-upgrade-scheme', default=False)
 @click.argument('url_', metavar='URL', required=True)
 @click.pass_obj
-def determine(ctx: Context, url_: str):
+def determine(ctx: Context, upgrade_scheme: bool, url_: str):
 
 	def log_info(msg: str, nl: bool = True):
 		click.secho(msg, nl=nl, err=True)
@@ -109,13 +116,14 @@ def determine(ctx: Context, url_: str):
 	def log_special(msg: str, nl: bool = True):
 		click.secho(msg, fg='blue', nl=nl, err=True)
 
-	url = ats.Url.from_url(url_)
+	endpoint = ats.Endpoint.from_url(url_)
 
-	if url is None:
-		raise click.BadOptionUsage('url', f"Invalid URL: {url}")
+	if endpoint is None:
+		raise click.BadOptionUsage('url', f"Invalid endpoint: {endpoint}")
 
-	result = ats.find_best_configuration(
-		url=url,
+	configuration, diagnostics = ats.find_best_configuration(
+		endpoint=endpoint,
+		upgrade_scheme=upgrade_scheme,
 		identity=ctx.identity,
 		log_info=log_info,
 		log_error=log_error,
@@ -123,14 +131,160 @@ def determine(ctx: Context, url_: str):
 		log_special=log_special,
 	)
 
-	click.echo(json.dumps(result))
+	if configuration is None:
+		click.secho("Failed to determine configuration:", fg='red', err=True)
+		click.echo(json.dumps([entry.json_dict() for entry in diagnostics]))
+		exit(1)
+
+	click.echo(json.dumps(configuration.ats_dict()))
+
+
+@cli.command()
+@click.argument(
+	'output_dir',
+	type=click.Path(file_okay=False, dir_okay=True, readable=True, writable=True),
+	required=True,
+)
+@click.argument(
+	'urls_',
+	metavar='URL',
+	type=click.File('r'),
+	required=True,
+)
+@click.pass_obj
+def collect_diagnostics(ctx: Context, output_dir: str, urls_: TextIOWrapper):
+	global _tqdm_buf
+	_tqdm_buf = ''
+
+	output_path = Path(output_dir)
+
+	output_path.mkdir(parents=True, exist_ok=True)
+
+	endpoints: Set[ats.Endpoint] = set()
+	for line in urls_.read().splitlines(keepends=False):
+		endpoint = ats.Endpoint.from_url(line)
+		if endpoint is None:
+			raise click.BadOptionUsage('urls', f"Invalid endpoint: {line}")
+		endpoints.add(endpoint)
+
+	failing: Set[ats.Endpoint] = set()
+
+	with tqdm(
+		desc="Analyzing URLs",
+		total=len(endpoints),
+		leave=True,
+		file=sys.stderr,
+	) as progress:
+
+		def log(msg: str, nl: bool = True):
+			global _tqdm_buf
+
+			prefix = ''
+			if _tqdm_buf:
+				prefix = term_move_up() + '\r'
+
+			_tqdm_buf += msg
+			progress.write(prefix + _tqdm_buf, file=sys.stderr)
+
+			if nl:
+				_tqdm_buf = ''
+
+			# Does not work, see https://github.com/tqdm/tqdm/issues/737
+			#progress.write(msg, file=sys.stderr, end='\n' if nl else '')
+
+		def log_info(msg: str, nl: bool = True):
+			log(msg, nl)
+
+		def log_error(msg: str, nl: bool = True):
+			log(click.style(msg, fg='red'), nl)
+
+		def log_success(msg: str, nl: bool = True):
+			log(click.style(msg, fg='green'), nl)
+
+		def log_special(msg: str, nl: bool = True):
+			log(click.style(msg, fg='blue'), nl)
+
+		def log_warn(msg: str, nl: bool = True):
+			log(click.style(msg, fg='yellow'), nl)
+
+		for endpoint in endpoints:
+			path = output_path / f'{endpoint.reverse_domain_name}.json'
+			relpath = path.relative_to(output_path)
+
+			log_info(click.style(f"{endpoint}", bold=True))
+
+			if not endpoint.is_ip and endpoint.is_local:
+				log_special("  → ", nl=False)
+				log_warn("Local domain, skipping.")
+				progress.update()
+				continue
+
+			if path.exists():
+				log_special("  → ", nl=False)
+				log_warn("Result already exists, skipping.")
+				progress.update()
+				continue
+
+			configuration, diagnostics = ats.find_best_configuration(
+				endpoint=endpoint,
+				upgrade_scheme=False,
+				identity=ctx.identity,
+				log_info=log_info,
+				log_error=log_error,
+				log_success=log_success,
+				log_special=log_special,
+			)
+			result = {
+				'configuration': configuration.ats_dict() if configuration else None,
+				'diagnostics': [entry.json_dict() for entry in diagnostics],
+			}
+			if configuration is not None:
+				path.write_text(json.dumps(result))
+				log_special("  • ", nl=False)
+				log_success(f"Results written to {relpath}")
+			else:
+				failing.add(endpoint)
+				log_error(json.dumps(result, indent=2))
+			progress.update()
+
+	# Summarize failures
+	click.secho("Failing:", fg='red', bold=True, err=True)
+	for endpoint in failing:
+		click.secho(f"  {endpoint}", fg='red', err=True)
+
+
+@cli.command()
+@click.argument(
+	'data_dir',
+	type=click.Path(dir_okay=True, file_okay=False, readable=True),
+)
+def find_endpoints(data_dir: str):
+	import os
+	import subprocess
+
+	for current, dirs, files in os.walk(data_dir):
+		for fn in files:
+			if fn == 'executable.bin':
+				path = os.path.join(current, fn)
+				app = os.path.dirname(os.path.relpath(path, data_dir))
+				click.echo(app, err=True)
+				strings = subprocess.run(
+					['strings', '-', '-a', path],
+					check=True,
+					capture_output=True,
+					text=True,
+				)
+				lines = strings.stdout.splitlines(keepends=False)
+				for line in lines:
+					for endpoint in ats.Endpoint.find_instances(line):
+						click.echo(endpoint)
 
 
 @cli.group()
 def test_environment():
 	"""
 	A test environment is required for some tests, namely tests involing a live
-	server. Without a test environment, these tests will fail, as the `atsdiag`
+	server. Without a test environment, these tests will fail, as the `atsprobe`
 	utility will not be able to establish an encrypted connection to the test
 	server.
 	"""

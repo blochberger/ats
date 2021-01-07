@@ -11,29 +11,44 @@ from random import randint
 
 import ddt
 
-import ats
+from ats import (
+	Configuration,
+	DiagnoseUtility,
+	Diagnostics,
+	DomainConfiguration,
+	Endpoint,
+	Error,
+	SSLError,
+	TlsVersion,
+	find_best_configuration,
+)
 
 from tests import requires_test_environment, TestEnvironment, OPENSSL
 
 
 @ddt.ddt
-class TestUrl(unittest.TestCase):
+class TestEndpoint(unittest.TestCase):
 
 	@ddt.data('foo', 'http://', 'ftp://example.com', 'file:///foo')
 	def test_from_url_negative(self, value: str):
-		url = ats.Url.from_url(value)
-		self.assertIsNone(url)
+		endpoint = Endpoint.from_url(value)
+		self.assertIsNone(endpoint)
 
 	@ddt.data(
-		'http://example.com',
-		'https://example.com',
-		'https://example.com:443',
-		'https://example.com:443/path?key=value#fragment',
+		('http://example.com', 'http://example.com/'),
+		('http://example.com:80/', 'http://example.com/'),
+		('http://example.com:1234', 'http://example.com:1234/'),
+		('HTTP://EXAMPLE.COM/PATH', 'http://example.com/'),
+		('https://example.com', 'https://example.com/'),
+		('http://example.com:443', 'http://example.com:443/'),
+		('http://example.com/path?key=value#fragment', 'http://example.com/'),
+		('http://example.com/foo/..', 'http://example.com/'),
 	)
-	def test_from_url(self, value: str):
-		url = ats.Url.from_url(value)
-		self.assertIsNotNone(url)
-		self.assertEqual(value, str(url))
+	@ddt.unpack
+	def test_from_url(self, value: str, expected: str):
+		endpoint = Endpoint.from_url(value)
+		self.assertIsNotNone(endpoint)
+		self.assertEqual(expected, str(endpoint))
 
 	@ddt.data(
 		('http://localhost/', True),
@@ -43,10 +58,9 @@ class TestUrl(unittest.TestCase):
 	)
 	@ddt.unpack
 	def test_is_local(self, value: str, expected: bool):
-		url = ats.Url.from_url(value)
-		assert url is not None
-		actual = url.is_local
-		self.assertEqual(actual, expected)
+		endpoint = Endpoint.from_url(value)
+		assert endpoint is not None
+		self.assertEqual(endpoint.is_local, expected)
 
 	@ddt.data(
 		('http://localhost/', False),
@@ -55,34 +69,46 @@ class TestUrl(unittest.TestCase):
 	)
 	@ddt.unpack
 	def test_is_ip(self, value: str, expected: bool):
-		url = ats.Url.from_url(value)
-		assert url is not None
-		actual = url.is_ip
-		self.assertEqual(actual, expected)
+		endpoint = Endpoint.from_url(value)
+		assert endpoint is not None
+		self.assertEqual(endpoint.is_ip, expected)
 
 	@ddt.data(
-		('http://example.com', True),
-		('https://example.com', False),
+		('http://example.com', False),
+		('https://example.com', True),
 	)
 	@ddt.unpack
-	def test_is_http(self, value: str, expected: bool):
-		url = ats.Url.from_url(value)
-		assert url is not None
-		actual = url.is_http
-		self.assertEqual(actual, expected)
+	def test_uses_tls(self, value: str, expected: bool):
+		endpoint = Endpoint.from_url(value)
+		assert endpoint is not None
+		self.assertEqual(endpoint.uses_tls, expected)
 
 	@ddt.data(
-		('http://example.com', 'https://example.com'),
-		('https://example.com', 'https://example.com'),
+		('http://example.com', 'https://example.com/'),
+		('https://example.com', 'https://example.com/'),
+		('http://example.com:1234', 'https://example.com:1234/'),
 	)
 	@ddt.unpack
-	def test_with_https(self, value: str, expected_value: str):
-		url = ats.Url.from_url(value)
-		assert url is not None
-		expected = ats.Url.from_url(expected_value)
+	def test_with_tls(self, value: str, expected_value: str):
+		endpoint = Endpoint.from_url(value)
+		assert endpoint is not None
+		expected = Endpoint.from_url(expected_value)
 		assert expected is not None
-		actual = url.with_https
-		self.assertEqual(actual, expected)
+		self.assertEqual(endpoint.with_tls, expected)
+
+	@ddt.data(
+		('http', []),
+		('http://', []),
+		('http://example.com', ['http://example.com/']),
+		('https://example.com', ['https://example.com/']),
+		('HTTP://example.com', ['http://example.com/']),
+		('Location: https://%s:%d%s', []),
+		('http://%@:%@', []),
+	)
+	@ddt.unpack
+	def test_find_instances(self, value: str, expected: List[str]):
+		actual = [str(endpoint) for endpoint in Endpoint.find_instances(value)]
+		self.assertEqual(expected, actual)
 
 
 @ddt.ddt
@@ -99,22 +125,23 @@ class TestDiagnostics(unittest.TestCase):
 		return Path(self._temp_dir.name)
 
 	def test_unknown_host(self):
-		url = ats.Url.from_url('https://not-reachable')
+		endpoint = Endpoint.from_url('https://not-reachable')
+		assert endpoint is not None
 
-		target_path = self.temp_dir / 'atsdiag'
+		target_path = self.temp_dir / 'atsprobe'
 
-		atsdiag = ats.DiagnoseUtility.compile_and_sign(
+		atsprobe = DiagnoseUtility.compile_and_sign(
 			target_path=target_path,
 		)
 
-		diagnostics_list = atsdiag.run({url})
+		diagnostics_list = atsprobe.run({endpoint})
 
 		self.assertEqual(len(diagnostics_list), 1)
 
 		diagnostics = diagnostics_list[0]
 
 		self.assertIn('url', diagnostics)
-		self.assertEqual(diagnostics['url'], str(url))
+		self.assertEqual(diagnostics['url'], str(endpoint))
 
 		self.assertIn('timestamp', diagnostics)
 		self.assertIn('error', diagnostics)
@@ -122,14 +149,15 @@ class TestDiagnostics(unittest.TestCase):
 		error = diagnostics['error']
 
 		self.assertIn('code', error)
-		self.assertEqual(error['code'], ats.ErrorCodes.DomainNotFound)
+		self.assertEqual(error['code'], Error.CannotFindHost)
 
 	@ddt.data('https://127.0.0.1/', 'https://[::1]:443/')
-	def test_find_best_configuration(self, url_str: str):
-		url = ats.Url.from_url(url_str)
-		assert url is not None
-		result = ats.find_best_configuration(url)
-		self.assertIsNone(result)
+	def test_find_best_configuration(self, url: str):
+		endpoint = Endpoint.from_url(url)
+		assert endpoint is not None
+		configuration, diagnostics = find_best_configuration(endpoint)
+		self.assertEqual(configuration, Configuration())
+		self.assertEqual(diagnostics, [Diagnostics(endpoint)])
 
 
 @ddt.ddt
@@ -165,7 +193,7 @@ class TestDiagnosticsLive(unittest.TestCase):
 
 	def start_server(
 		self,
-		maximum_tls_version: Optional[ats.TlsVersion] = None,
+		maximum_tls_version: Optional[TlsVersion] = None,
 		opts: Optional[List[str]] = None,
 	):
 		assert self.server is None
@@ -175,7 +203,7 @@ class TestDiagnosticsLive(unittest.TestCase):
 
 		if maximum_tls_version is not None:
 			max_protocol = str(maximum_tls_version)
-			if maximum_tls_version is ats.TlsVersion.TLSv1_0:
+			if maximum_tls_version is TlsVersion.TLSv1_0:
 				max_protocol = max_protocol[:-2]
 			opts += ['-max_protocol', max_protocol]
 
@@ -205,63 +233,66 @@ class TestDiagnosticsLive(unittest.TestCase):
 
 	def compile_helper(
 		self,
-		ats_configuration: ats.Configuration,
-	) -> ats.DiagnoseUtility:
-		target_path = self.temp_dir / 'atsdiag'
+		configuration: Configuration,
+	) -> DiagnoseUtility:
+		target_path = self.temp_dir / 'atsprobe'
 
-		atsdiag = ats.DiagnoseUtility.compile_and_sign_with(
-			ats_configuration=ats_configuration,
-			exception_domains={'localhost'},
+		atsprobe = DiagnoseUtility.compile_and_sign_with(
+			configuration=configuration,
 			target_path=target_path,
 		)
 
-		return atsdiag
+		return atsprobe
 
 	@property
-	def url(self) -> ats.Url:
-		url = ats.Url.from_url(f'https://localhost:{self.port}/')
-		assert url is not None
-		return url
+	def endpoint(self) -> Endpoint:
+		endpoint = Endpoint.from_url(f'https://localhost:{self.port}/')
+		assert endpoint is not None
+		return endpoint
 
 	@requires_test_environment
 	@ddt.data(
-		(ats.Configuration.Default, ats.TlsVersion.TLSv1_2, []),
-		(ats.Configuration.Default, ats.TlsVersion.TLSv1_3, []),
+		(DomainConfiguration(), TlsVersion.TLSv1_2, []),
+		(DomainConfiguration(), TlsVersion.TLSv1_3, []),
 		(
-			ats.Configuration.Default.with_tls_version(ats.TlsVersion.TLSv1_3),
-			ats.TlsVersion.TLSv1_3,
+			DomainConfiguration(tls_version=TlsVersion.TLSv1_3),
+			TlsVersion.TLSv1_3,
 			[],
 		),
 		(
-			ats.Configuration.Default & ~ats.Configuration.RequiresForwardSecrecy,
-			ats.TlsVersion.TLSv1_2,
+			DomainConfiguration(forward_secrecy=False),
+			TlsVersion.TLSv1_2,
 			[],
 		),
 		(
-			ats.Configuration.Default & ~ats.Configuration.RequiresForwardSecrecy,
-			ats.TlsVersion.TLSv1_2,
+			DomainConfiguration(forward_secrecy=False),
+			TlsVersion.TLSv1_2,
 			['-no_dhe', '-cipher', 'AES256-GCM-SHA384'],  # disable FS
 		),
 	)
 	@ddt.unpack
-	def test_atsdiag_positive(
+	def test_atsprobe_positive(
 		self,
-		configuration: ats.Configuration,
-		maximum_tls_version: ats.TlsVersion,
+		domain_configuration: DomainConfiguration,
+		maximum_tls_version: TlsVersion,
 		server_opts: List[str],
 	):
+		configuration = Configuration(
+			exceptions={self.endpoint.host: domain_configuration}
+		)
+
 		self.start_server(maximum_tls_version=maximum_tls_version, opts=server_opts)
 
-		atsdiag = self.compile_helper(configuration)
+		atsprobe = self.compile_helper(configuration)
 
-		diagnostics_list = atsdiag.run({self.url})
+		diagnostics_list = atsprobe.run({self.endpoint})
 
 		self.assertEqual(len(diagnostics_list), 1)
 
 		diagnostics = diagnostics_list[0]
 
 		self.assertIn('url', diagnostics)
-		self.assertEqual(diagnostics['url'], str(self.url))
+		self.assertEqual(diagnostics['url'], str(self.endpoint))
 
 		self.assertIn('timestamp', diagnostics)
 
@@ -269,47 +300,51 @@ class TestDiagnosticsLive(unittest.TestCase):
 
 	@requires_test_environment
 	@ddt.data(
-		(ats.Configuration.Default, ats.TlsVersion.TLSv1_0, ats.ErrorCodes.TlsError, []),
-		(ats.Configuration.Default, ats.TlsVersion.TLSv1_1, ats.ErrorCodes.TlsError, []),
+		(DomainConfiguration(), TlsVersion.TLSv1_0, SSLError.PeerProtocolVersion, []),
+		(DomainConfiguration(), TlsVersion.TLSv1_1, SSLError.PeerProtocolVersion, []),
 		(  # Test certificate is not in CT log
-			ats.Configuration.MostSecure,
-			ats.TlsVersion.TLSv1_3,
-			ats.ErrorCodes.NoCertificateTransparency,
+			DomainConfiguration.most_secure(),
+			TlsVersion.TLSv1_3,
+			SSLError.FatalAlert,
 			[],
 		),
 		(
-			ats.Configuration.Default.with_tls_version(ats.TlsVersion.TLSv1_3),
-			ats.TlsVersion.TLSv1_2,
-			ats.ErrorCodes.TlsError,
+			DomainConfiguration(tls_version=TlsVersion.TLSv1_3),
+			TlsVersion.TLSv1_2,
+			SSLError.PeerProtocolVersion,
 			[],
 		),
 		(
-			ats.Configuration.Default,
-			ats.TlsVersion.TLSv1_2,  # PFS is enforced in TLSv1.3
-			ats.ErrorCodes.NoForwardSecrecy,
+			DomainConfiguration(),
+			TlsVersion.TLSv1_2,  # PFS is enforced in TLSv1.3
+			SSLError.PeerHandshakeFail,
 			['-no_dhe', '-cipher', 'AES256-GCM-SHA384'],  # disable FS
 		),
 	)
 	@ddt.unpack
-	def test_atsdiag_negative(
+	def test_atsprobe_negative(
 		self,
-		configuration: ats.Configuration,
-		maximum_tls_version: ats.TlsVersion,
-		error_code: ats.ErrorCodes,
+		domain_configuration: DomainConfiguration,
+		maximum_tls_version: TlsVersion,
+		error_code: SSLError,
 		server_opts: List[str],
 	):
+		configuration = Configuration(
+			exceptions={self.endpoint.host: domain_configuration}
+		)
+
 		self.start_server(maximum_tls_version=maximum_tls_version, opts=server_opts)
 
-		atsdiag = self.compile_helper(configuration)
+		atsprobe = self.compile_helper(configuration)
 
-		diagnostics_list = atsdiag.run({self.url})
+		diagnostics_list = atsprobe.run({self.endpoint})
 
 		self.assertEqual(len(diagnostics_list), 1)
 
 		diagnostics = diagnostics_list[0]
 
 		self.assertIn('url', diagnostics)
-		self.assertEqual(diagnostics['url'], str(self.url))
+		self.assertEqual(diagnostics['url'], str(self.endpoint))
 
 		self.assertIn('timestamp', diagnostics)
 
@@ -321,22 +356,18 @@ class TestDiagnosticsLive(unittest.TestCase):
 
 		code = error['code']
 
-		self.assertEqual(code, ats.ErrorCodes.SSLError)
+		self.assertEqual(code, Error.SSLError)
 
-		self.assertIn('userInfo', error)
+		self.assertIn('streamErrorCode', error)
 
-		user_info = error['userInfo']
-
-		self.assertIn('_kCFStreamErrorCodeKey', user_info)
-
-		stream_error_code = int(user_info['_kCFStreamErrorCodeKey'])
+		stream_error_code = int(error['streamErrorCode'])
 
 		self.assertEqual(stream_error_code, error_code)
 
 	@requires_test_environment
 	@ddt.data(
 		(
-			ats.TlsVersion.TLSv1_3,
+			TlsVersion.TLSv1_3,
 			[],
 			{'NSExceptionDomains': {'localhost': {
 				'NSExceptionMinimumTLSVersion': 'TLSv1.3',
@@ -346,14 +377,25 @@ class TestDiagnosticsLive(unittest.TestCase):
 	@ddt.unpack
 	def test_find_best_configuration(
 		self,
-		maximum_tls_version: ats.TlsVersion,
+		maximum_tls_version: TlsVersion,
 		server_opts: List[str],
 		expected: Optional[Dict[str, Any]],
 	):
 		self.start_server(maximum_tls_version=maximum_tls_version, opts=server_opts)
 
-		actual = ats.find_best_configuration(self.url)
-		self.assertEqual(expected, actual)
+		configuration_found, diagnostic_results = find_best_configuration(self.endpoint)
+
+		self.assertIsNotNone(configuration_found)
+		self.assertEqual(len(diagnostic_results), 1)
+
+		diagnostics = diagnostic_results[0].json_dict()
+
+		self.assertIn('configuration', diagnostics)
+
+		configuration_used = diagnostics['configuration']
+
+		self.assertEqual(expected, configuration_used)
+		self.assertEqual(expected, configuration_found.ats_dict())
 
 
 if __name__ == '__main__':

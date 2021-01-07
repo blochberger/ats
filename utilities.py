@@ -119,9 +119,8 @@ class Utility:
 
 		assert not target_path.is_dir(), f"Invalid target: {target_path}"
 
-		name = cls.name()
 		source_dir = cls.source_dir()
-		source_path = source_dir / f'{name}.swift'
+		source_path = source_dir / 'main.swift'
 		if info_plist_path is None:
 			info_plist_path = cls.default_info_plist_path()
 

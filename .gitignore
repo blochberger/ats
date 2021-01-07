@@ -1,6 +1,7 @@
 # Project-specific
 */_CodeSignature
-atsdiag/atsdiag
+atsprobe/atsprobe
+atsprobe/atsprobe_noats
 plsan/plsan
 
 # Python
@@ -8,3 +9,6 @@ __pycache__
 *.egg-info
 .coverage
 htmlcov
+
+# Xcode
+xcuserdata
