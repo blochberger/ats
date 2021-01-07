@@ -233,18 +233,17 @@ def collect_diagnostics(ctx: Context, output_dir: str, urls_: TextIOWrapper):
 				log_error=log_error,
 				log_success=log_success,
 				log_special=log_special,
+				level=1,
 			)
 			result = {
 				'configuration': configuration.ats_dict() if configuration else None,
 				'diagnostics': [entry.json_dict() for entry in diagnostics],
 			}
-			if configuration is not None:
-				path.write_text(json.dumps(result))
-				log_special("  • ", nl=False)
-				log_success(f"Results written to {relpath}")
-			else:
+			path.write_text(json.dumps(result))
+			log_special("  · ", nl=False)
+			log_success(f"Results written to {relpath}")
+			if configuration is None:
 				failing.add(endpoint)
-				log_error(json.dumps(result, indent=2))
 			progress.update()
 
 	# Summarize failures

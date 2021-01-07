@@ -807,7 +807,12 @@ def find_best_configuration(
 	log_success: Optional[LogFunc] = None,
 	log_special: Optional[LogFunc] = None,
 	redirected_from: Optional[Set[Endpoint]] = None,
+	level: int = 0,
 ) -> Tuple[Optional[Configuration], List[Diagnostics]]:
+	assert 0 <= level
+
+	def prefix(level: int) -> str:
+		return log_info("  " * level, nl=False)
 
 	# TODO Detect if scheme was upgraded from HTTP and fallback to HTTP if
 	# the upgraded endpoint does not connect.
@@ -823,7 +828,8 @@ def find_best_configuration(
 	if redirected_from is None:
 		redirected_from = set()
 
-	log_info(style(f"  {endpoint} ", bold=True), nl=False)
+	prefix(level)
+	log_info(style(f"{endpoint} ", bold=True), nl=False)
 
 	# Ignore IPv4 and IPv6 addresses
 	if endpoint.is_ip:
@@ -833,7 +839,8 @@ def find_best_configuration(
 	# HTTP -> HTTPS
 	if upgrade_scheme and not endpoint.uses_tls:
 		log_error("× No TLS")
-		log_special("  → ", nl=False)
+		prefix(level)
+		log_special("→ ", nl=False)
 		new_endpoint = endpoint.with_tls
 		log_info(f"Upgrading scheme to HTTPS: {new_endpoint}")
 		return find_best_configuration(
@@ -844,6 +851,7 @@ def find_best_configuration(
 			log_success=log_success,
 			log_special=log_special,
 			redirected_from=redirected_from,
+			level=level,
 		)
 	log_success("✓")
 
@@ -859,9 +867,11 @@ def find_best_configuration(
 
 			target_path = temp_dir / f'atsprobe-{str(configuration)}'
 
-			log_special("  · ", nl=False)
+			prefix(level)
+			log_special("· ", nl=False)
 			log_info(f"Configuration {configuration.display()}")
-			log_special("    · ", nl=False)
+			prefix(level + 1)
+			log_special("· ", nl=False)
 			log_info("Compiling helper... ", nl=False)
 			atsprobe = DiagnoseUtility.compile_and_sign_with(
 				configuration=configuration,
@@ -870,14 +880,15 @@ def find_best_configuration(
 			)
 			log_success("✓")
 
-			log_special("    · ", nl=False)
+			prefix(level + 1)
+			log_special("· ", nl=False)
 			log_info("Connecting... ", nl=False)
-			diagnostics = atsprobe.run({endpoint})[0]
+			probe_results = atsprobe.run({endpoint})[0]
 
-			error: Dict[str, Any] = diagnostics.get('error', dict())
+			error: Dict[str, Any] = probe_results.get('error', dict())
 
-			timestamp = timestamp_from_str(diagnostics['timestamp'])
-			redirected = Endpoint.from_url(diagnostics.get('redirectedUrl', ''))
+			timestamp = timestamp_from_str(probe_results['timestamp'])
+			redirected = Endpoint.from_url(probe_results.get('redirectedUrl', ''))
 
 			if redirected is not None:
 				# A redirection indicates that an HTTP request was performed.
@@ -890,7 +901,8 @@ def find_best_configuration(
 				# most secure.
 
 				log_success("✓")
-				log_special("    · ", nl=False)
+				prefix(level + 1)
+				log_special("· ", nl=False)
 				log_info(f"Redirected to: {redirected} ", nl=False)
 
 				diagnostic_results.append(Diagnostics.success(
@@ -926,6 +938,7 @@ def find_best_configuration(
 					log_success=log_success,
 					log_special=log_special,
 					redirected_from=redirected_from.union({endpoint}),
+					level=level,
 				)
 
 				diagnostic_results.extend(r_diagnostics)
@@ -970,37 +983,43 @@ def find_best_configuration(
 
 			if Action.EnableCertificateTransparency in actions:
 				assert not certificate_transparency
-				log_special("    → ", nl=False)
+				prefix(level + 1)
+				log_special("→ ", nl=False)
 				log_info("Re-enabling requirement for certificate transparency")
 				certificate_transparency = True
 
 			if Action.DisableCertificateTransparency in actions:
 				assert certificate_transparency
-				log_special("    → ", nl=False)
+				prefix(level + 1)
+				log_special("→ ", nl=False)
 				log_info("Disabling requirement for certificate transparency")
 				certificate_transparency = False
 
 			if Action.EnableForwardSecrecy in actions:
 				assert not forward_secrecy
-				log_special("    → ", nl=False)
+				prefix(level + 1)
+				log_special("→ ", nl=False)
 				log_info("Re-enabling requirement for forward secrecy")
 				forward_secrecy = True
 
 			if Action.DisableForwardSecrecy in actions:
 				assert forward_secrecy
-				log_special("    → ", nl=False)
+				prefix(level + 1)
+				log_special("→ ", nl=False)
 				log_info("Disabling requirement for forward secrecy")
 				forward_secrecy = False
 
 			if Action.DecreaseTlsVersion in actions:
 				assert domain_configuration.can_decrease_tls_version
 				tls_version = TlsVersion(tls_version - 1)
-				log_special("    → ", nl=False)
+				prefix(level + 1)
+				log_special("→ ", nl=False)
 				log_info(f"Decreasing required TLS version to {tls_version}")
 
 			if Action.AllowHttp in actions:
 				assert not insecure_http_loads
-				log_special("    → ", nl=False)
+				prefix(level + 1)
+				log_special("→ ", nl=False)
 				log_info("Allowing insecure HTTP loads")
 				insecure_http_loads = True
 
@@ -1021,14 +1040,16 @@ def find_best_configuration(
 
 			if Action.AllowLocal in actions:
 				assert not local_networking
-				log_special("    → ", nl=False)
+				prefix(level + 1)
+				log_special("→ ", nl=False)
 				log_info("Allowing local networking")
 				local_networking = True
 				del exceptions[endpoint.host]
 
 			if Action.AllowArbitraryLoads in actions:
 				assert not arbitrary_loads
-				log_special("    → ", nl=False)
+				prefix(level + 1)
+				log_special("→ ", nl=False)
 				log_info("Disabling ATS")
 				arbitrary_loads = True
 				del exceptions[endpoint.host]
@@ -1040,14 +1061,16 @@ def find_best_configuration(
 			)
 
 			if actions in {Action.GiveUp, Action.Investigate}:
-				diagnostic_results.append(Diagnostics.erroneous(
+				diagnostics = Diagnostics.erroneous(
 					endpoint,
 					configuration=configuration,
 					timestamp=timestamp,
 					redirected=redirected,
 					error=error,
-				))
-				return (
-					configuration if actions is Action.GiveUp else None,
-					diagnostic_results
 				)
+				diagnostic_results.append(diagnostics)
+
+				if actions is Action.Investigate:
+					log_error(json.dumps(diagnostics.json_dict(), indent=2))
+
+				return (None, diagnostic_results)
