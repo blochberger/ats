@@ -1,4 +1,6 @@
 import json
+import os
+import subprocess
 import sys
 
 from dataclasses import dataclass
@@ -258,9 +260,6 @@ def collect_diagnostics(ctx: Context, output_dir: str, urls_: TextIOWrapper):
 	type=click.Path(dir_okay=True, file_okay=False, readable=True),
 )
 def find_endpoints(data_dir: str):
-	import os
-	import subprocess
-
 	for current, dirs, files in os.walk(data_dir):
 		for fn in files:
 			if fn == 'executable.bin':
