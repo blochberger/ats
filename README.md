@@ -2,4 +2,4 @@
 
 `ats` is a command line utility for testing and managing ATS configurations for macOS and iOS applications.
 
-![Screenshot of the ats command line utility](screenshot.png)
+<img src="screenshot.png" width="591" height="484" alt="Screenshot of the ats command line utility in action"/>
