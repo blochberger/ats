@@ -38,6 +38,27 @@ def timestamp_from_str(value: str) -> datetime:
 	return datetime.fromisoformat(value)
 
 
+def get_bool(source: Dict[str, Any], key: str, default: bool) -> bool:
+	value = source.get(key, default)
+	if type(value) is not bool:
+		raise ValueError(f"Unexpected value for '{key}': {value}")
+	return value
+
+
+def get_str(source: Dict[str, Any], key: str, default: str) -> str:
+	value = source.get(key, default)
+	if type(value) is not str:
+		raise ValueError(f"Unexpected value for '{key}': {value}")
+	return value
+
+
+def get_dict(source: Dict[str, Any], key: str, default: dict) -> dict:
+	value = source.get(key, default)
+	if type(value) is not dict:
+		raise ValueError(f"Unexpected value for '{key}': {value}")
+	return value
+
+
 @enum.unique
 class Error(enum.IntEnum):
 	"""
@@ -366,6 +387,42 @@ class DomainConfiguration:
 	def can_decrease_tls_version(self) -> bool:
 		return TlsVersion.TLSv1_0 < self.tls_version
 
+	def _values_lt(self, other: 'DomainConfiguration') -> Tuple[bool, bool, bool, bool]:
+		return (
+			self.insecure_http_loads and not other.insecure_http_loads,
+			self.tls_version < other.tls_version,
+			not self.forward_secrecy and other.forward_secrecy,
+			not self.certificate_transparency and other.certificate_transparency,
+		)
+
+	def _values_gt(self, other: 'DomainConfiguration') -> Tuple[bool, bool, bool, bool]:
+		return (
+			not self.insecure_http_loads and other.insecure_http_loads,
+			self.tls_version > other.tls_version,
+			self.forward_secrecy and not other.forward_secrecy,
+			self.certificate_transparency and not other.certificate_transparency,
+		)
+
+	def __lt__(self, other: Any) -> bool:
+
+		if type(other) is not self.__class__:
+			raise NotImplementedError
+
+		return any(self._values_lt(other)) and not any(self._values_gt(other))
+
+	def __le__(self, other: Any) -> bool:
+		return self == other or self < other
+
+	def __gt__(self, other: Any) -> bool:
+
+		if type(other) is not self.__class__:
+			raise NotImplementedError
+
+		return any(self._values_gt(other)) and not any(self._values_lt(other))
+
+	def __ge__(self, other: Any) -> bool:
+		return self == other or self > other
+
 	def __str__(self) -> str:
 		return unstyle(self.display())
 
@@ -444,6 +501,50 @@ class DomainConfiguration:
 			configuration['NSRequiresCertificateTransparency'] = self.certificate_transparency
 
 		return configuration
+
+	@classmethod
+	def from_ats_dict(cls, ats_dict: Dict[str, Any]) -> 'DomainConfiguration':
+		default = cls()
+
+		includes_subdomains = get_bool(
+			ats_dict,
+			'NSIncludesSubdomains',
+			default.includes_subdomains,
+		)
+		insecure_http_loads = get_bool(
+			ats_dict,
+			'NSExceptionAllowsInsecureHTTPLoads',
+			default.insecure_http_loads,
+		)
+		forward_secrecy = get_bool(
+			ats_dict,
+			'NSExceptionRequiresForwardSecrecy',
+			default.forward_secrecy,
+		)
+		certificate_transparency = get_bool(
+			ats_dict,
+			'NSRequiresCertificateTransparency',
+			default.certificate_transparency,
+		)
+
+		tls_version_str = get_str(
+			ats_dict,
+			'NSExceptionMinimumTLSVersion',
+			str(default.tls_version),
+		)
+		tls_version = TlsVersion.from_str(tls_version_str)
+		if tls_version is None:
+			raise ValueError(
+				f"Invalid value for 'NSExceptionMinimumTLSVersion': {tls_version_str}"
+			)
+
+		return cls(
+			includes_subdomains=includes_subdomains,
+			insecure_http_loads=insecure_http_loads,
+			tls_version=tls_version,
+			forward_secrecy=forward_secrecy,
+			certificate_transparency=certificate_transparency,
+		)
 
 
 @dataclass(frozen=True)
@@ -557,6 +658,33 @@ class Configuration:
 			configuration['NSExceptionDomains'] = exceptions
 
 		return configuration
+
+	@classmethod
+	def from_ats_dict(cls, ats_dict: Dict[str, Any]) -> 'Configuration':
+		default = cls()
+
+		arbitrary_loads = get_bool(
+			ats_dict,
+			'NSAllowsArbitraryLoads',
+			default.arbitrary_loads,
+		)
+
+		local_networking = get_bool(
+			ats_dict,
+			'NSAllowsLocalNetworking',
+			default.local_networking,
+		)
+
+		exception_domains = get_dict(ats_dict, 'NSExceptionDomains', dict())
+		exceptions: Dict[str, DomainConfiguration] = dict()
+		for domain, exception_ats_dict in exception_domains.items():
+			exceptions[domain] = DomainConfiguration.from_ats_dict(exception_ats_dict)
+
+		return cls(
+			arbitrary_loads=arbitrary_loads,
+			local_networking=local_networking,
+			exceptions=exceptions,
+		)
 
 
 @dataclass(frozen=True)

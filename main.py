@@ -4,10 +4,11 @@ import subprocess
 import sys
 
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 from io import TextIOWrapper
 from time import sleep
-from typing import Any, List, Optional, Set
+from typing import Any, Dict, List, Optional, Set
 
 import click
 
@@ -25,6 +26,12 @@ from tests import TestEnvironment
 
 
 _tqdm_buf = ''
+
+
+def percentage(value: int, total: int) -> float:
+	if total == 0:
+		return 0
+	return (value / total) * 100.0
 
 
 class CodesigningIdentityParam(click.ParamType):
@@ -276,6 +283,281 @@ def find_endpoints(data_dir: str):
 				for line in lines:
 					for endpoint in ats.Endpoint.find_instances(line):
 						click.echo(endpoint)
+
+
+@cli.command()
+@click.argument(
+	'diagnostics_dir',
+	type=click.Path(dir_okay=True, file_okay=False, readable=True),
+)
+def evaluate_diagnostics(diagnostics_dir: str):
+
+	endpoints: Set[ats.Endpoint] = set()
+	redirections: Dict[ats.Endpoint, ats.Endpoint] = dict()
+	configurations: Dict[str, ats.Configuration] = dict()
+	first: Optional[datetime] = None
+	last: Optional[datetime] = None
+
+	# Parse diagnostics
+	diagnostics_path = Path(diagnostics_dir)
+	for entry in diagnostics_path.iterdir():
+		if not entry.is_file():
+			continue
+
+		reverse_domain_name = entry.stem
+
+		with entry.open('r') as f:
+			data: Dict[str, Any] = json.load(f)
+
+		ats_dict: Optional[Dict[str, Any]] = data.get('configuration', None)
+		diagnostic_results: List[Dict[str, Any]] = data.get('diagnostics', [])
+
+		for diagnostics in diagnostic_results:
+			endpoint = ats.Endpoint.from_url(diagnostics.get('url', ''))
+			assert endpoint is not None
+			endpoints.add(endpoint)
+
+			redirected = ats.Endpoint.from_url(diagnostics.get('redirected_url', ''))
+			if redirected is not None:
+				endpoints.add(redirected)
+				redirections[endpoint] = redirected
+
+			if timestamp_str := diagnostics.get('timestamp', None):
+				timestamp = ats.timestamp_from_str(timestamp_str)
+				if first is None or timestamp < first:
+					first = timestamp
+				if last is None or last < timestamp:
+					last = timestamp
+
+		if ats_dict is not None:
+			configuration = ats.Configuration.from_ats_dict(ats_dict)
+			configurations[reverse_domain_name] = configuration
+
+	hosts = {endpoint.host for endpoint in endpoints}
+	hosts_ats = {endpoint.host for endpoint in endpoints if not endpoint.is_ip}
+	hosts_noats = hosts - hosts_ats
+	hosts_local = {endpoint.host for endpoint in endpoints if endpoint.is_local}
+
+	# Evaluate diagnostics
+	endpoints_with_standard_port = {
+		endpoint for endpoint in endpoints if endpoint.has_standard_port
+	}
+	endpoints_with_tls = {
+		endpoint for endpoint in endpoints if endpoint.uses_tls
+	}
+
+	redirects_to_https = {
+		source: target
+		for source, target in redirections.items()
+		if not source.uses_tls and target.uses_tls
+	}
+	redirects_https_upgrade = {
+		source: target
+		for source, target in redirects_to_https.items()
+		if source.host == target.host
+	}
+	redirects_to_http = {
+		source: target
+		for source, target in redirections.items()
+		if source.uses_tls and not target.uses_tls
+	}
+
+	transitive_redirects: List[List[ats.Endpoint]] = []
+	for source, target in redirections.items():
+		if source in redirections.values():
+			continue  # Only start with root sources
+		transitive_target: Optional[ats.Endpoint] = target
+		path = [source]
+		while transitive_target is not None:
+			was_in_path = transitive_target in path
+			path.append(transitive_target)
+			transitive_target = redirections.get(transitive_target, None)
+			if was_in_path:
+				break
+		transitive_redirects.append(path)
+	transitive_redirects_to_https = [
+		path
+		for path in transitive_redirects
+		if not path[0].uses_tls and path[-1].uses_tls
+	]
+	transitive_redirects_to_http = [
+		path
+		for path in transitive_redirects
+		if path[0].uses_tls and not path[-1].uses_tls
+	]
+	transitive_redirects_pure_https = [
+		path
+		for path in transitive_redirects
+		if all(endpoint.uses_tls for endpoint in path)
+	]
+	transitive_redirects_pure_http = [
+		path
+		for path in transitive_redirects
+		if all(not endpoint.uses_tls for endpoint in path)
+	]
+
+	transitive_redirects_http_prefix: List[List[ats.Endpoint]] = []
+	for path in transitive_redirects_to_https:
+		assert not path[0].uses_tls
+		assert path[-1].uses_tls
+
+		in_suffix = False
+		http_in_suffix = False
+		for endpoint in path[1:-1]:
+			in_suffix |= endpoint.uses_tls
+			if in_suffix and not endpoint.uses_tls:
+				http_in_suffix = True
+				break
+		if not http_in_suffix:
+			transitive_redirects_http_prefix.append(path)
+
+	configurations_j = {
+		k: v
+		for k, v in configurations.items()
+		if v.requires_justification
+	}
+	configurations_nd = {
+		k: v
+		for k, v in configurations.items()
+		if not v.is_default
+	}
+	configurations_noats = {
+		k: v
+		for k, v in configurations.items()
+		if not v.arbitrary_loads and 0 == len(v.exceptions)
+	}
+	configurations_local = {
+		k: v
+		for k, v in configurations.items()
+		if v.local_networking
+	}
+
+	http = {
+		domain
+		for k, configuration in configurations.items()
+		for domain, exception in configuration.exceptions.items()
+		if exception.insecure_http_loads
+	}
+	fs = {
+		domain
+		for k, configuration in configurations.items()
+		for domain, exception in configuration.exceptions.items()
+		if exception.forward_secrecy
+	}
+	ct = {
+		domain
+		for k, configuration in configurations.items()
+		for domain, exception in configuration.exceptions.items()
+		if exception.certificate_transparency
+	}
+	tls1_0 = {
+		domain
+		for k, configuration in configurations.items()
+		for domain, exception in configuration.exceptions.items()
+		if exception.tls_version is ats.TlsVersion.TLSv1_0
+	}
+	tls1_1 = {
+		domain
+		for k, configuration in configurations.items()
+		for domain, exception in configuration.exceptions.items()
+		if exception.tls_version is ats.TlsVersion.TLSv1_1
+	}
+	tls1_2 = {
+		domain
+		for k, configuration in configurations.items()
+		for domain, exception in configuration.exceptions.items()
+		if exception.tls_version is ats.TlsVersion.TLSv1_2
+	}
+	tls1_3 = {
+		domain
+		for k, configuration in configurations.items()
+		for domain, exception in configuration.exceptions.items()
+		if exception.tls_version is ats.TlsVersion.TLSv1_3
+	}
+	non_default = {
+		domain: exception
+		for k, configuration in configurations.items()
+		for domain, exception in configuration.exceptions.items()
+		if not exception.is_default
+	}
+	most_secure = {
+		domain: exception
+		for k, configuration in configurations.items()
+		for domain, exception in configuration.exceptions.items()
+		if exception == ats.DomainConfiguration.most_secure()
+	}
+	more_secure = {
+		domain: exception
+		for k, configuration in configurations.items()
+		for domain, exception in configuration.exceptions.items()
+		if ats.DomainConfiguration() < exception
+	}
+	less_secure = {
+		domain: exception
+		for k, configuration in configurations.items()
+		for domain, exception in configuration.exceptions.items()
+		if exception < ats.DomainConfiguration()
+	}
+	mixed = {
+		domain: exception
+		for k, configuration in configurations.items()
+		for domain, exception in configuration.exceptions.items()
+		if not (exception < ats.DomainConfiguration() or exception > ats.DomainConfiguration())
+	}
+	requires_justification = {
+		domain: exception
+		for k, configuration in configurations.items()
+		for domain, exception in configuration.exceptions.items()
+		if exception.requires_justification
+	}
+
+	def pp(value: int, total: int) -> str:
+		return f"{value:5d} ({percentage(value, total):6.2f} %)"
+
+	# Output results
+	click.secho(f"Results from {first} – {last}", fg='blue', bold=True)
+
+	click.secho(f"Endpoints:                {len(endpoints):5d}", bold=True)
+	click.echo(f"  with standard port:     {pp(len(endpoints_with_standard_port), len(endpoints))}")
+	click.echo(f"  with TLS:               {pp(len(endpoints_with_tls), len(endpoints))}")
+	click.echo(f"  domains:                {pp(len(hosts), len(endpoints))}")
+
+	click.secho(f"Direct redirections:      {len(redirections):5d}", bold=True)
+	click.echo(f"  HTTP -> HTTPS:          {pp(len(redirects_to_https), len(redirections))}")
+	click.echo(f"  HTTP -> HTTPS upgrade:  {pp(len(redirects_https_upgrade), len(redirections))}")
+	click.echo(f"  HTTPS -> HTTP:          {pp(len(redirects_to_http), len(redirections))}")
+
+	click.secho(f"Transitive redirections:  {len(transitive_redirects):5d}", bold=True)
+	click.echo(f"  HTTP -> HTTPS:          {pp(len(transitive_redirects_to_https), len(transitive_redirects))}")
+	click.echo(f"    upgrade only:         {pp(len(transitive_redirects_http_prefix), len(transitive_redirects_to_https))}")
+	click.echo(f"  HTTPS -> HTTP:          {pp(len(transitive_redirects_to_http), len(transitive_redirects))}")
+	click.echo(f"  pure HTTPS:             {pp(len(transitive_redirects_pure_https), len(transitive_redirects))}")
+	click.echo(f"  pure HTTP:              {pp(len(transitive_redirects_pure_http), len(transitive_redirects))}")
+
+	click.secho(f"Configurations:           {len(configurations):5d}", bold=True)
+	click.echo(f"  requires justification: {pp(len(configurations_j), len(configurations))}")
+	click.echo(f"  non-default:            {pp(len(configurations_nd), len(configurations))}")
+	click.echo(f"  ATS disabled:           {pp(len(configurations_noats), len(configurations))}")
+	click.echo(f"  local:                  {pp(len(configurations_local), len(configurations))}")
+
+	click.secho(f"Domains:                  {len(hosts):5d}", bold=True)
+	click.echo(f"  not affected by ATS:    {pp(len(hosts_noats), len(hosts))}")
+	click.echo(f"  local:                  {pp(len(hosts_local), len(hosts))}")
+
+	click.secho(f"Domain diagnostics:       {len(hosts_ats):5d}", bold=True)
+	click.echo(f"  non-default             {pp(len(non_default), len(hosts_ats))}")
+	click.echo(f"  most-secure             {pp(len(most_secure), len(hosts_ats))}")
+	click.echo(f"  better than default:    {pp(len(more_secure), len(hosts_ats))}")
+	click.echo(f"  worse than default:     {pp(len(less_secure), len(hosts_ats))}")
+	click.echo(f"  mixed:                  {pp(len(mixed), len(hosts_ats))}")
+	click.echo(f"  requires justification: {pp(len(requires_justification), len(hosts_ats))}")
+	click.echo(f"  HTTP:                   {pp(len(http), len(hosts_ats))}")
+	click.echo(f"  FS:                     {pp(len(fs), len(hosts_ats))}")
+	click.echo(f"  CT:                     {pp(len(ct), len(hosts_ats))}")
+	click.echo(f"  TLSv1.0:                {pp(len(tls1_0), len(hosts_ats))}")
+	click.echo(f"  TLSv1.1:                {pp(len(tls1_1), len(hosts_ats))}")
+	click.echo(f"  TLSv1.2:                {pp(len(tls1_2), len(hosts_ats))}")
+	click.echo(f"  TLSv1.3:                {pp(len(tls1_3), len(hosts_ats))}")
 
 
 @cli.group()
