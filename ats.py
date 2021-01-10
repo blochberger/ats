@@ -151,8 +151,6 @@ class Error(enum.IntEnum):
 	- Trying to connect without TLS to a TLS server
 	"""
 
-	CannotParseResponse = -1017 # TODO Add to atsprobe
-
 	ATSError = -1022
 	"""
 	- Occurs for HTTP, even if the URL would redirect to HTTPS
