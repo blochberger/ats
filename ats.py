@@ -31,6 +31,52 @@ def no_log(msg: str, nl: bool = True):
 	pass
 
 
+def is_ip(value: str) -> bool:
+	try:
+		ip_address(value)
+	except ValueError:
+		return False
+	return True
+
+
+def is_localdomain(domain: str) -> bool:
+	return '.' not in domain or domain.endswith('.local')
+
+
+def is_subdomain(domain: str, of: str) -> bool:
+	lhs = domain.split('.')[::-1]
+	rhs = of.split('.')[::-1]
+
+	if len(lhs) <= len(rhs):
+		return False
+
+	for i in range(len(rhs)):
+		if lhs[i] != rhs[i]:
+			return False
+
+	return True
+
+
+def is_valid_host(value: str) -> bool:
+	# A trailing dot is allowed, although discouraged
+	if value.endswith('.'):
+		value = value[:-1]
+
+	if 253 < len(value):
+		return False
+
+	parts = value.split('.')
+
+	# The TLD must not be numeric only
+	tld = parts[-1]
+	if re.fullmatch(r'[0-9]+', tld):
+		return False
+
+	# Only lower-case hostnames should be used
+	rx = re.compile(r'(?!-)[a-z0-9-]{1,63}(?<!-)$')
+	return all(rx.match(part) for part in value.split('.'))
+
+
 def timestamp_from_str(value: str) -> datetime:
 	# Python cannot handle Z-marker
 	if value.endswith('Z'):
@@ -38,24 +84,48 @@ def timestamp_from_str(value: str) -> datetime:
 	return datetime.fromisoformat(value)
 
 
-def get_bool(source: Dict[str, Any], key: str, default: bool) -> bool:
+def key_variants(key: str) -> Iterator[Tuple[str, bool]]:
+	assert key.startswith('NSException')
+	suffix = key[len('NSException'):]
+
+	assert suffix in {
+		'AllowsInsecureHTTPLoads',
+		'MinimumTLSVersion',
+		'RequiresForwardSecrecy',
+	}
+
+	# Order of prefixes is important!
+	prefixes = ['', 'ThirdParty', 'Temporary', 'TemporaryThirdParty']
+
+	for i, prefix in enumerate(prefixes):
+		variant = 'NS' + prefix + 'Exception' + suffix
+		yield (variant, 0 < i)
+
+
+def get_bool(source: Dict[str, Any], key: str, default: bool, strict: bool = True) -> bool:
 	value = source.get(key, default)
 	if type(value) is not bool:
-		raise ValueError(f"Unexpected value for '{key}': {value}")
-	return value
+		if strict:
+			raise ValueError(f"Unexpected value for '{key}': {value}")
+		return default
+	return bool(value)
 
 
-def get_str(source: Dict[str, Any], key: str, default: str) -> str:
+def get_str(source: Dict[str, Any], key: str, default: str, strict: bool = True) -> str:
 	value = source.get(key, default)
 	if type(value) is not str:
-		raise ValueError(f"Unexpected value for '{key}': {value}")
+		if strict:
+			raise ValueError(f"Unexpected value for '{key}': {value}")
+		return default
 	return value
 
 
-def get_dict(source: Dict[str, Any], key: str, default: dict) -> dict:
+def get_dict(source: Dict[str, Any], key: str, default: dict, strict: bool = True) -> dict:
 	value = source.get(key, default)
 	if type(value) is not dict:
-		raise ValueError(f"Unexpected value for '{key}': {value}")
+		if strict:
+			raise ValueError(f"Unexpected value for '{key}': {value}")
+		return default
 	return value
 
 
@@ -240,7 +310,7 @@ class Endpoint:
 
 	@property
 	def is_local(self) -> bool:
-		return '.' not in self.host or self.host.endswith('.local')
+		return is_localdomain(self.host)
 
 	@property
 	def has_standard_port(self) -> bool:
@@ -250,11 +320,7 @@ class Endpoint:
 
 	@property
 	def is_ip(self) -> bool:
-		try:
-			ip_address(self.host)
-		except ValueError:
-			return False
-		return True
+		return is_ip(self.host)
 
 	@property
 	def reverse_domain_name(self) -> str:
@@ -278,6 +344,23 @@ class Endpoint:
 		except ssl.SSLError:
 			return None
 
+	def __lt__(self, other: Any) -> bool:
+		if type(other) is not Endpoint:
+			raise TypeError
+		return (
+			self.reverse_domain_name < other.reverse_domain_name or
+			(self.reverse_domain_name == other.reverse_domain_name and self.port < other.port)
+		)
+
+	def __le__(self, other: Any) -> bool:
+		return self == other or self < other
+
+	def __gt__(self, other: Any) -> bool:
+		return other < self
+
+	def __ge__(self, other: Any) -> bool:
+		return self == other or self > other
+
 	def __str__(self) -> str:
 		result = f'{self.scheme}://{self.host}'
 		if not self.has_standard_port:
@@ -294,24 +377,34 @@ class Endpoint:
 		if parsed.scheme not in {'http', 'https'}:
 			return None
 
-		uses_tls = parsed.scheme == 'https'
 		host = host.lower()
+		if not (is_valid_host(host) or is_ip(host)):
+			return None
+
+		uses_tls = parsed.scheme == 'https'
+
 		port: int
-		if parsed.port is None:
-			port = 443 if uses_tls else 80
-		else:
-			port = parsed.port
+		try:
+			if parsed.port is None:
+				port = 443 if uses_tls else 80
+			else:
+				port = parsed.port
+		except ValueError:
+			return None
 
 		return cls(uses_tls=uses_tls, host=host, port=port)
 
 	@classmethod
-	def find_instances(cls, value: str) -> Iterator['Endpoint']:
+	def find_instances(cls, value: str, log_error: Optional[LogFunc] = None) -> Iterator['Endpoint']:
 		"""
 		Searches for URLs in a string and yields endpoints.
 		"""
 
+		if log_error is None:
+			log_error = no_log
+
 		scheme_rx = re.compile(r'https?://', re.IGNORECASE)
-		path_rx = re.compile(r'/')
+		path_rx = re.compile(r'[/"() ]')
 
 		value = value.strip().lower()
 
@@ -319,7 +412,7 @@ class Endpoint:
 		for placeholder in ['%@', '%s', '%d', '%i', '%ld', '%li']:
 			value = value.replace(placeholder, '')
 
-		def emit_candidate(candidate: str, scheme_end: int) -> Optional['Endpoint']:
+		def emit_candidate(candidate: str, scheme_end: int, log_error: LogFunc) -> Optional['Endpoint']:
 			if candidate.endswith(':'):
 				candidate = candidate[:-1]
 
@@ -328,8 +421,7 @@ class Endpoint:
 
 			endpoint = cls.from_url(candidate)
 			if endpoint is None:
-				import sys
-				print(f"\tUnexpected : endpoint{candidate}", file=sys.stderr)
+				log_error(f"Unexpected endpoint: {candidate}")
 			return endpoint
 
 		while scheme_match := scheme_rx.search(value):
@@ -338,11 +430,11 @@ class Endpoint:
 			scheme_end = scheme_match.end() - scheme_match.start()
 			if path_match := path_rx.search(value[scheme_end:]):
 				path_start = scheme_end + path_match.start()
-				if endpoint := emit_candidate(value[:path_start], scheme_end):
+				if endpoint := emit_candidate(value[:path_start], scheme_end, log_error):
 					yield endpoint
 				value = value[path_start + 1:]
 				continue
-			if endpoint := emit_candidate(value, scheme_end):
+			if endpoint := emit_candidate(value, scheme_end, log_error):
 				yield endpoint
 			break
 
@@ -546,6 +638,58 @@ class DomainConfiguration:
 			certificate_transparency=certificate_transparency,
 		)
 
+	@classmethod
+	def from_info_plist(cls, ats_dict: Dict[str, Any]) -> 'DomainConfiguration':
+		default = cls()
+
+		includes_subdomains = get_bool(
+			ats_dict,
+			'NSIncludesSubdomains',
+			default.includes_subdomains,
+			strict=False,
+		)
+
+		def get_bool_respecting_variants(key: str, default: bool) -> bool:
+			for variant, is_deprecated in key_variants(key):
+				value = get_bool(ats_dict, variant, default, strict=False)
+				if variant in ats_dict and value:
+					return value
+			return default
+
+		insecure_http_loads = get_bool_respecting_variants(
+			'NSExceptionAllowsInsecureHTTPLoads',
+			default.insecure_http_loads,
+		)
+
+		forward_secrecy = get_bool_respecting_variants(
+			'NSExceptionRequiresForwardSecrecy',
+			default.forward_secrecy,
+		)
+
+		tls_version: TlsVersion
+		for variant, is_deprecated in key_variants('NSExceptionMinimumTLSVersion'):
+			value_str = get_str(ats_dict, variant, str(default.tls_version), strict=False)
+			value = TlsVersion.from_str(value_str)
+			if variant in ats_dict and value is not None:
+				tls_version = value
+				break
+			tls_version = default.tls_version
+
+		certificate_transparency = get_bool(
+			ats_dict,
+			'NSRequiresCertificateTransparency',
+			default.certificate_transparency,
+			strict=False,
+		)
+
+		return cls(
+			includes_subdomains=includes_subdomains,
+			insecure_http_loads=insecure_http_loads,
+			tls_version=tls_version,
+			forward_secrecy=forward_secrecy,
+			certificate_transparency=certificate_transparency,
+		)
+
 
 @dataclass(frozen=True)
 class Configuration:
@@ -588,6 +732,35 @@ class Configuration:
 			exception.requires_justification
 			for exception in self.exceptions.values()
 		)
+
+	def __getitem__(self, key: Any) -> DomainConfiguration:
+
+		host: str
+		if type(key) is str:
+			host = key
+		elif type(key) is Endpoint:
+			host = key.host
+		else:
+			raise TypeError
+
+		if is_ip(host):
+			# Host is not affected by ATS
+			raise KeyError
+
+		# Check whether host is subdomain of any exception domain and whether
+		# that exception domain's configuration includes subdomains.
+		for domain, exception in self.exceptions.items():
+			if domain == host or (is_subdomain(host, domain) and exception.includes_subdomains):
+				return exception
+
+		# No domain configuration for the given key
+
+		if not self.arbitrary_loads:
+			# If ATS is not disabled, the default configuration applies to
+			# unknown hosts.
+			return DomainConfiguration()
+
+		raise KeyError
 
 	def __str__(self) -> str:
 		return unstyle(self.display())
@@ -685,6 +858,55 @@ class Configuration:
 			local_networking=local_networking,
 			exceptions=exceptions,
 		)
+
+	@classmethod
+	def from_info_plist(cls, ats_dict: Dict[str, Any]) -> 'Configuration':
+		default = cls()
+
+		# TODO Handle version specifics:
+		# https://developer.apple.com/documentation/bundleresources/information_property_list/nsapptransportsecurity
+
+		arbitrary_loads = any([
+			get_bool(
+				ats_dict,
+				'NSAllowsArbitraryLoads',
+				default.arbitrary_loads,
+				strict=False,
+			),
+			get_bool(
+				ats_dict,
+				'NSAllowsArbitraryLoadsForMedia',
+				default.arbitrary_loads,
+				strict=False,
+			),
+			get_bool(
+				ats_dict,
+				'NSAllowsArbitraryLoadsInWebContent',
+				default.arbitrary_loads,
+				strict=False,
+			),
+		])
+
+		local_networking = get_bool(
+			ats_dict,
+			'NSAllowsLocalNetworking',
+			default.local_networking,
+			strict=False,
+		)
+
+		exception_domains = get_dict(ats_dict, 'NSExceptionDomains', dict(), strict=False)
+		exceptions: Dict[str, DomainConfiguration] = dict()
+		for domain, exception_ats_dict in exception_domains.items():
+			if not is_valid_host(domain):
+				continue
+			exceptions[domain] = DomainConfiguration.from_info_plist(exception_ats_dict)
+
+		return cls(
+			arbitrary_loads=arbitrary_loads,
+			local_networking=local_networking,
+			exceptions=exceptions,
+		)
+
 
 
 @dataclass(frozen=True)
