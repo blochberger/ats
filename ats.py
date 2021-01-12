@@ -40,6 +40,8 @@ def is_ip(value: str) -> bool:
 
 
 def is_localdomain(domain: str) -> bool:
+	if domain.endswith('.'):
+		domain = domain[:-1]
 	return '.' not in domain or domain.endswith('.local')
 
 
