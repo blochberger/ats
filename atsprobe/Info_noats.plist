@@ -3,7 +3,7 @@
 <plist version="1.0">
 <dict>
 	<key>CFBundleIdentifier</key>
-	<string>de.uni-hamburg.informatik.blochberger.atsdiag</string>
+	<string>de.uni-hamburg.informatik.blochberger.atsprobe</string>
 	<key>NSAppTransportSecurity</key>
 	<dict>
 		<key>NSAllowsArbitraryLoads</key>

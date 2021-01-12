@@ -3,6 +3,6 @@
 <plist version="1.0">
 <dict>
 	<key>CFBundleIdentifier</key>
-	<string>de.informatik.uni-hamburg.blochberger.atsprobe</string>
+	<string>de.uni-hamburg.informatik.blochberger.atsprobe</string>
 </dict>
 </plist>
