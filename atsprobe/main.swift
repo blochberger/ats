@@ -38,7 +38,6 @@ struct Endpoint: Hashable, Codable {
 		self.init(url: url)
 	}
 
-
 	var url: URL {
 		let scheme = usesTls ? "https" : "http"
 		let netloc: String
