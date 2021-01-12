@@ -733,7 +733,14 @@ class Configuration:
 			for exception in self.exceptions.values()
 		)
 
-	def __getitem__(self, key: Any) -> DomainConfiguration:
+	def __contains__(self, key: Any) -> bool:
+		try:
+			self[key]
+			return True
+		except KeyError:
+			return False
+
+	def __getitem__(self, key: Any) -> Tuple[Optional[str], DomainConfiguration]:
 
 		host: str
 		if type(key) is str:
@@ -751,16 +758,37 @@ class Configuration:
 		# that exception domain's configuration includes subdomains.
 		for domain, exception in self.exceptions.items():
 			if domain == host or (is_subdomain(host, domain) and exception.includes_subdomains):
-				return exception
+				return (domain, exception)
 
 		# No domain configuration for the given key
 
 		if not self.arbitrary_loads:
 			# If ATS is not disabled, the default configuration applies to
 			# unknown hosts.
-			return DomainConfiguration()
+			return (None, DomainConfiguration())
 
 		raise KeyError
+
+	def for_endpoint(self, endpoint: Endpoint) -> 'Configuration':
+		default = self.__class__()
+
+		exceptions: Dict[str, DomainConfiguration] = dict()
+		if endpoint in self:
+			domain, exception = self[endpoint]
+			if domain is not None:
+				# Normalize
+				if not all([
+					self.arbitrary_loads == default.arbitrary_loads,
+					self.local_networking == default.local_networking,
+					exception.is_default,
+				]):
+					exceptions = {domain: exception}
+
+		return self.__class__(
+			arbitrary_loads=self.arbitrary_loads,
+			local_networking=self.local_networking,
+			exceptions=exceptions,
+		)
 
 	def __str__(self) -> str:
 		return unstyle(self.display())
@@ -813,6 +841,19 @@ class Configuration:
 			local_networking=local_networking,
 			exceptions=exceptions,
 		)
+
+	def split(self) -> List['Configuration']:
+		if len(self.exceptions) <= 1:
+			return [self]
+
+		results: List['Configuration'] = []
+		for domain, exception in self.exceptions.items():
+			results.append(self.__class__(
+				arbitrary_loads=self.arbitrary_loads,
+				local_networking=self.local_networking,
+				exceptions={domain: exception},
+			))
+		return results
 
 	def ats_dict(self, simplify: bool = True) -> Dict[str, Dict[str, Any]]:
 		configuration: Dict[str, Any] = dict()
@@ -908,21 +949,24 @@ class Configuration:
 		)
 
 
-
 @dataclass(frozen=True)
 class Diagnostics:
 	endpoint: Endpoint
-	configuration: Optional[Configuration] = None
+	configuration: Configuration
+	timestamp: datetime
 	redirected: Optional[Endpoint] = None
-	timestamp: Optional[datetime] = None
 	error: Optional[Dict[str, Any]] = None
+
+	@property
+	def did_succeed(self) -> bool:
+		return self.error is None
 
 	def json_dict(self, simplify: bool = True) -> Dict[str, Any]:
 		return {
 			'url': str(self.endpoint),
 			'redirected_url': None if self.redirected is None else str(self.redirected),
-			'configuration': self.configuration.ats_dict(simplify=simplify) if self.configuration else None,
-			'timestamp': None if self.timestamp is None else self.timestamp.isoformat(),
+			'configuration': self.configuration.ats_dict(simplify=simplify),
+			'timestamp': self.timestamp.isoformat(),
 			'error': self.error,
 		}
 
@@ -954,6 +998,39 @@ class Diagnostics:
 			endpoint=endpoint,
 			configuration=configuration,
 			redirected=redirected,
+			timestamp=timestamp,
+			error=error,
+		)
+
+	@classmethod
+	def from_dict(cls, data: Dict[str, Any]) -> 'Diagnostics':
+		url = data['url']
+		endpoint = Endpoint.from_url(url)
+		if endpoint is None:
+			raise ValueError(f"Invalid endpoint ('url'): {url}")
+
+		redirected: Optional[Endpoint] = None
+		if redirected_url := data.get('redirected_url', None):
+			redirected = Endpoint.from_url(redirected_url)
+			if redirected is None:
+				raise ValueError(f"Invalid endpoint ('redirected_url'): {redirected_url}")
+
+		configuration: Configuration
+		if ats_dict := data['configuration']:
+			configuration = Configuration.from_ats_dict(ats_dict)
+
+		timestamp: Optional[datetime] = None
+		if timestamp_str := data.get('timestamp', None):
+			timestamp = timestamp_from_str(timestamp_str)
+			if timestamp is None:
+				raise ValueError(f"Invalid timestamp: {timestamp}")
+
+		error: Optional[Dict[str, Any]] = data.get('error', None)
+
+		return cls(
+			endpoint=endpoint,
+			redirected=redirected,
+			configuration=configuration,
 			timestamp=timestamp,
 			error=error,
 		)
@@ -1150,19 +1227,14 @@ def determine_action(
 
 def find_best_configuration(
 	endpoint: Endpoint,
-	upgrade_scheme: bool = False,
 	identity: Optional[CodesigningIdentity] = None,
 	log_info: Optional[LogFunc] = None,
 	log_error: Optional[LogFunc] = None,
 	log_success: Optional[LogFunc] = None,
 	log_special: Optional[LogFunc] = None,
 	redirected_from: Optional[Set[Endpoint]] = None,
-	level: int = 0,
-) -> Tuple[Optional[Configuration], List[Diagnostics]]:
-	assert 0 <= level
-
-	def prefix(level: int) -> str:
-		return log_info("  " * level, nl=False)
+) -> Diagnostics:
+	assert not endpoint.is_ip
 
 	# TODO Detect if scheme was upgraded from HTTP and fallback to HTTP if
 	# the upgraded endpoint does not connect.
@@ -1178,38 +1250,13 @@ def find_best_configuration(
 	if redirected_from is None:
 		redirected_from = set()
 
-	prefix(level)
-	log_info(style(f"{endpoint} ", bold=True), nl=False)
-
-	# Ignore IPv4 and IPv6 addresses
-	if endpoint.is_ip:
-		log_success("✓ Connections to IP addresses are ignored by ATS")
-		return (Configuration(), [Diagnostics(endpoint)])
-
-	# HTTP -> HTTPS
-	if upgrade_scheme and not endpoint.uses_tls:
-		log_error("× No TLS")
-		prefix(level)
-		log_special("→ ", nl=False)
-		new_endpoint = endpoint.with_tls
-		log_info(f"Upgrading scheme to HTTPS: {new_endpoint}")
-		return find_best_configuration(
-			endpoint=new_endpoint,
-			identity=identity,
-			log_info=log_info,
-			log_error=log_error,
-			log_success=log_success,
-			log_special=log_special,
-			redirected_from=redirected_from,
-			level=level,
-		)
-	log_success("✓")
+	def prefix(level: int) -> str:
+		assert log_info is not None
+		return log_info("  " * level, nl=False)
 
 	configuration = Configuration(
 		exceptions={endpoint.host: DomainConfiguration.most_secure()}
 	)
-
-	diagnostic_results: List[Diagnostics] = []
 
 	while True:
 		with tempfile.TemporaryDirectory(prefix='ats-') as temp_dir_:
@@ -1217,11 +1264,9 @@ def find_best_configuration(
 
 			target_path = temp_dir / f'atsprobe-{str(configuration)}'
 
-			prefix(level)
-			log_special("· ", nl=False)
+			log_special("  · ", nl=False)
 			log_info(f"Configuration {configuration.display()}")
-			prefix(level + 1)
-			log_special("· ", nl=False)
+			log_special("  · ", nl=False)
 			log_info("Compiling helper... ", nl=False)
 			atsprobe = DiagnoseUtility.compile_and_sign_with(
 				configuration=configuration,
@@ -1230,8 +1275,7 @@ def find_best_configuration(
 			)
 			log_success("✓")
 
-			prefix(level + 1)
-			log_special("· ", nl=False)
+			log_special("  · ", nl=False)
 			log_info("Connecting... ", nl=False)
 			probe_results = atsprobe.run({endpoint})[0]
 
@@ -1251,71 +1295,39 @@ def find_best_configuration(
 				# most secure.
 
 				log_success("✓")
-				prefix(level + 1)
-				log_special("· ", nl=False)
+				log_special("  · ", nl=False)
 				log_info(f"Redirected to: {redirected} ", nl=False)
 
-				diagnostic_results.append(Diagnostics.success(
+				diagnostics = Diagnostics.success(
 					endpoint,
 					configuration=configuration,
 					timestamp=timestamp,
 					redirected=redirected,
-				))
+				)
 
 				if redirected in redirected_from:
 					log_error("× Redirection loop, aborting")
-					return (configuration, diagnostic_results)
+					return diagnostics
 
 				if endpoint == redirected:
 					log_success("✓ (same endpoint)")
-					return (configuration, diagnostic_results)
+					return diagnostics
 
 				if endpoint.host == redirected.host:
 					log_error("× Same domain, but different scheme or port")
 				else:
 					log_error("× Different domain")
-
-				# The redirection target is differnt than the endpoint.
-				# Consequently, different TLS parameters might be used for the
-				# connection to the redirection target. Find the best ATS
-				# configuration for the redirection target and merge the
-				# configurations later.
-				r_configuration, r_diagnostics = find_best_configuration(
-					endpoint=redirected,
-					identity=identity,
-					log_info=log_info,
-					log_error=log_error,
-					log_success=log_success,
-					log_special=log_special,
-					redirected_from=redirected_from.union({endpoint}),
-					level=level,
-				)
-
-				diagnostic_results.extend(r_diagnostics)
-				if r_configuration is None:
-					return (None, diagnostic_results)
-
-				configuration = configuration.merged(r_configuration)
-
-				if endpoint.host == redirected.host:
-					# The endpoint is in the same domain. Hence, the same ATS
-					# configuration is used for both, the endpoint and the
-					# redirection target. If configurations do not match, a less
-					# secure configuration is used for one of the endpoints.
-					# TODO Notify the user about the problem.
-					pass
-
-				return (configuration, diagnostic_results)
+				return diagnostics
 
 			if not error:
 				log_success("✓")
-				diagnostic_results.append(Diagnostics.success(
+				diagnostics = Diagnostics.success(
 					endpoint,
 					timestamp=timestamp,
 					configuration=configuration,
 					redirected=redirected,
-				))
-				return (configuration, diagnostic_results)
+				)
+				return diagnostics
 
 			log_error("× ", nl=False)
 
@@ -1333,48 +1345,39 @@ def find_best_configuration(
 
 			if Action.EnableCertificateTransparency in actions:
 				assert not certificate_transparency
-				prefix(level + 1)
-				log_special("→ ", nl=False)
+				log_special("  → ", nl=False)
 				log_info("Re-enabling requirement for certificate transparency")
 				certificate_transparency = True
 
 			if Action.DisableCertificateTransparency in actions:
 				assert certificate_transparency
-				prefix(level + 1)
-				log_special("→ ", nl=False)
+				log_special("  → ", nl=False)
 				log_info("Disabling requirement for certificate transparency")
 				certificate_transparency = False
 
 			if Action.EnableForwardSecrecy in actions:
 				assert not forward_secrecy
-				prefix(level + 1)
-				log_special("→ ", nl=False)
+				log_special("  → ", nl=False)
 				log_info("Re-enabling requirement for forward secrecy")
 				forward_secrecy = True
 
 			if Action.DisableForwardSecrecy in actions:
 				assert forward_secrecy
-				prefix(level + 1)
-				log_special("→ ", nl=False)
+				log_special("  → ", nl=False)
 				log_info("Disabling requirement for forward secrecy")
 				forward_secrecy = False
 
 			if Action.DecreaseTlsVersion in actions:
 				assert domain_configuration.can_decrease_tls_version
 				tls_version = TlsVersion(tls_version - 1)
-				prefix(level + 1)
-				log_special("→ ", nl=False)
+				log_special("  → ", nl=False)
 				log_info(f"Decreasing required TLS version to {tls_version}")
 
 			if Action.AllowHttp in actions:
 				assert not insecure_http_loads
-				prefix(level + 1)
-				log_special("→ ", nl=False)
+				log_special("  → ", nl=False)
 				log_info("Allowing insecure HTTP loads")
 				insecure_http_loads = True
-
-				# TODO The best configuration for HTTPS-URLs of the same
-				# domain still need to be determined.
 
 			local_networking = configuration.local_networking
 			arbitrary_loads = configuration.arbitrary_loads
@@ -1390,16 +1393,14 @@ def find_best_configuration(
 
 			if Action.AllowLocal in actions:
 				assert not local_networking
-				prefix(level + 1)
-				log_special("→ ", nl=False)
+				log_special("  → ", nl=False)
 				log_info("Allowing local networking")
 				local_networking = True
 				del exceptions[endpoint.host]
 
 			if Action.AllowArbitraryLoads in actions:
 				assert not arbitrary_loads
-				prefix(level + 1)
-				log_special("→ ", nl=False)
+				log_special("  → ", nl=False)
 				log_info("Disabling ATS")
 				arbitrary_loads = True
 				del exceptions[endpoint.host]
@@ -1418,9 +1419,6 @@ def find_best_configuration(
 					redirected=redirected,
 					error=error,
 				)
-				diagnostic_results.append(diagnostics)
-
 				if actions is Action.Investigate:
 					log_error(json.dumps(diagnostics.json_dict(), indent=2))
-
-				return (None, diagnostic_results)
+				return diagnostics
