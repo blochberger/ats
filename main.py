@@ -1,6 +1,4 @@
 import json
-import plistlib
-import subprocess
 import sys
 
 from collections import defaultdict
@@ -9,7 +7,7 @@ from datetime import datetime
 from functools import cached_property
 from pathlib import Path
 from time import sleep
-from typing import Any, Dict, Iterator, List, Optional, Set, Tuple
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 import click
 
@@ -18,6 +16,9 @@ from tqdm import tqdm
 from tqdm._utils import _term_move_up as term_move_up
 
 import ats
+import maap
+
+from maap import App
 from utilities import (
 	CodesigningIdentity,
 	PlistSanitizer,
@@ -139,6 +140,44 @@ class Table:
 
 				# End row
 				click.echo("")
+
+	def markdown(self):
+		def bold(value: str) -> str:
+			return "**" + value + "**"
+
+		# Print column headers
+		if 1 < len(self.columns) and self.columns != ['']:
+			click.echo("|| " + (" | ".join(map(bold, self.columns))) + " |")
+			click.echo("| " + (" | ".join(["---"] * (len(self.columns) + 1))) + " |")
+
+		for group in self.groups:
+			rows = [''] + self.rows_per_group[group]
+
+			# Print rows
+			for row in rows:
+				is_group = row == ''
+				values = self.values[group][row]
+
+				# Print row header
+				if is_group:
+					click.echo(f"| {bold(group)}", nl=False)
+				else:
+					click.echo(f"| {row}", nl=False)
+
+				# Print columns
+				for column in self.columns:
+					total = self.values[group][''].get(column, None)
+					value = values.get(column, None)
+					if not (total is None or value is None):
+						if is_group:
+							click.echo(f" | {bold(str(value))}", nl=False)
+						else:
+							click.echo(f" | {value} ({percentage(value, total):.2f}%)", nl=False)
+					else:
+						click.echo(" | ", nl=False)
+
+				# End row
+				click.echo(" |")
 
 
 @dataclass(frozen=True)
@@ -299,76 +338,38 @@ class DiagnosticResults:
 
 
 @dataclass(frozen=True)
-class AppResults:
-	configurations: Dict[str, ats.Configuration]
-	versions: Dict[str, str]
-	endpoints_from_binary: Dict[str, Set[ats.Endpoint]]
-	endpoints_from_ats: Dict[str, Set[ats.Endpoint]]
-
-	@property
-	def bundle_ids(self) -> Set[str]:
-		return set(self.versions.keys())
+class Evaluation:
+	dataset: maap.Dataset
+	diagnostics: DiagnosticResults
 
 	@cached_property
-	def endpoints(self) -> Dict[str, Set[ats.Endpoint]]:
-		return {
-			bundle_id: self.endpoints_from_binary[bundle_id].union(
-				self.endpoints_from_ats[bundle_id]
-			)
-			for bundle_id in self.bundle_ids
-		}
+	def endpoints(self) -> Set[ats.Endpoint]:
+		return self.dataset.endpoints.union(self.diagnostics.endpoints)
 
-	@classmethod
-	def parse(cls, maap_path: Path) -> 'AppResults':
-		configurations: Dict[str, ats.Configuration] = dict()
-		versions: Dict[str, str] = dict()
-		endpoints_from_binary: Dict[str, Set[ats.Endpoint]] = defaultdict(set)
-		endpoints_from_ats: Dict[str, Set[ats.Endpoint]] = defaultdict(set)
+	@cached_property
+	def app_endpoints(self) -> Dict[App, Set[ats.Endpoint]]:
+		results: Dict[App, Set[ats.Endpoint]] = dict()
+		for app in self.dataset.apps:
+			result: Set[ats.Endpoint] = app.endpoints
+			queue = app.relevant_endpoints  # Diagnostics only exist for relevant
+			while queue:
+				source = queue.pop()
+				if target := self.diagnostics.redirections.get(source, None):
+					if target in result:
+						continue  # Redirection loop
+					queue.add(target)
+					result.add(target)
+			assert len(app.endpoints) <= len(result)
+			results[app] = result
+		return results
 
-		for path, bundle_id, version_id in maap_walk(maap_path):
-			versions[bundle_id] = version_id
-
-			#click.secho(f"{bundle_id} / {version_id}", dim=True)
-
-			info_path = path / 'Info.plist'
-			endpoints_path = path / 'endpoints.json'
-
-			# Parse ATS configuration
-			if info_path.exists():
-				with info_path.open('rb') as f:
-					info: Dict[str, Any] = plistlib.load(f)
-
-				configuration: ats.Configuration
-				if ats_dict := info.get('NSAppTransportSecurity', None):
-					configuration = ats.Configuration.from_info_plist(ats_dict)
-				else:
-					# If there is no explicit ATS configuration, the default
-					# configuration applies.
-					configuration = ats.Configuration()
-
-				configurations[bundle_id] = configuration
-
-			# Parse endpoints
-			if endpoints_path.exists():
-				with endpoints_path.open('rb') as f:
-					endpoints_dict: Dict[str, List[str]] = json.load(f)
-				if urls := endpoints_dict.get('executable', list()):
-					for url in urls:
-						endpoint = ats.Endpoint.from_url(url)
-						assert endpoint is not None, f"Invalid endpoint: {url}"
-						endpoints_from_binary[bundle_id].add(endpoint)
-				if urls := endpoints_dict.get('ats', list()):
-					for url in urls:
-						endpoint = ats.Endpoint.from_url(url)
-						assert endpoint is not None, f"Invalid endpoint: {url}"
-						endpoints_from_ats[bundle_id].add(endpoint)
-
-		return cls(
-			configurations=configurations,
-			versions=versions,
-			endpoints_from_binary=endpoints_from_binary,
-			endpoints_from_ats=endpoints_from_ats,
-		)
+	@cached_property
+	def endpoint_apps(self) -> Dict[ats.Endpoint, Set[App]]:
+		results: Dict[ats.Endpoint, Set[App]] = defaultdict(set)
+		for app, app_endpoints in self.app_endpoints.items():
+			for endpoint in app_endpoints:
+				results[endpoint].add(app)
+		return results
 
 
 def endpoint_statistics(
@@ -606,34 +607,6 @@ def failure_statistics(
 		table.add_row(grp, row, count, column)
 
 
-def maap_walk(
-	maap_path: Path,
-	include_all_versions: bool = False,
-) -> Iterator[Tuple[Path, str, str]]:
-	ignored = {'.DS_Store', 'b.UNKNOWN'}
-
-	for maap_bundle in maap_path.iterdir():
-		if not maap_bundle.is_dir() or maap_bundle.name in ignored:
-			continue
-
-		bundle_id = maap_bundle.name
-
-		version_ids = natsorted([
-			maap_version.name
-			for maap_version in maap_bundle.iterdir()
-			if maap_version.is_dir()
-		])
-		if not version_ids:
-			continue
-
-		if include_all_versions:
-			for version_id in version_ids:
-				yield (maap_path / bundle_id / version_id, bundle_id, version_id)
-		else:
-			version_id = version_ids[-1]
-			yield (maap_path / bundle_id / version_id, bundle_id, version_id)
-
-
 class CodesigningIdentityParam(click.ParamType):
 	name = 'identity'
 
@@ -708,10 +681,9 @@ def compile(ctx: Context):
 
 
 @cli.command()
-@click.option('--upgrade-scheme/--no-upgrade-scheme', default=False)
 @click.argument('url_', metavar='URL', required=True)
 @click.pass_obj
-def determine(ctx: Context, upgrade_scheme: bool, url_: str):
+def determine(ctx: Context, url_: str):
 
 	def log_info(msg: str, nl: bool = True):
 		click.secho(msg, nl=nl, err=True)
@@ -734,9 +706,8 @@ def determine(ctx: Context, upgrade_scheme: bool, url_: str):
 		click.secho(f"Endpoint is not affected by ATS: {endpoint}", fg='red', err=True)
 		exit(1)
 
-	configuration, diagnostics = ats.find_best_configuration(
+	diagnostics = ats.find_best_configuration(
 		endpoint=endpoint,
-		upgrade_scheme=upgrade_scheme,
 		identity=ctx.identity,
 		log_info=log_info,
 		log_error=log_error,
@@ -744,18 +715,20 @@ def determine(ctx: Context, upgrade_scheme: bool, url_: str):
 		log_special=log_special,
 	)
 
-	if configuration is None:
-		click.secho("Failed to determine configuration:", fg='red', err=True)
-		click.echo(json.dumps([entry.json_dict() for entry in diagnostics]))
+	click.echo(json.dumps(diagnostics.json_dict()))
+	if not diagnostics.did_succeed:
 		exit(1)
-
-	click.echo(json.dumps(configuration.ats_dict()))
 
 
 @cli.command()
+@click.option(
+	'--upgrade-scheme/--no-upgrade-scheme',
+	default=True,
+	show_default=True,
+)
 @click.argument(
-	'maap_dir',
-	type=click.Path(dir_okay=True, file_okay=False, readable=True),
+	'urls_file',
+	type=click.Path(dir_okay=False, file_okay=True, readable=True),
 )
 @click.argument(
 	'output_dir',
@@ -763,30 +736,42 @@ def determine(ctx: Context, upgrade_scheme: bool, url_: str):
 	required=True,
 )
 @click.pass_obj
-def collect_diagnostics(ctx: Context, maap_dir: str, output_dir: str):
-	maap_path = Path(maap_dir)
+def collect_diagnostics(
+	ctx: Context,
+	upgrade_scheme: bool,
+	urls_file: str,
+	output_dir: str,
+):
+	urls_path = Path(urls_file)
 	output_path = Path(output_dir)
-
-	app_results = AppResults.parse(maap_path)
-
 	output_path.mkdir(parents=True, exist_ok=True)
 
 	pending: Set[ats.Endpoint] = set()
-	upgraded: Set[ats.Endpoint] = set()
-	for bundle_id, bundle_endpoints in app_results.endpoints.items():
-		for endpoint in bundle_endpoints:
-			pending.add(endpoint)
-			with_tls = endpoint.with_tls
-			if not endpoint.uses_tls and not with_tls in app_results.endpoints.values():
-				pending.add(with_tls)
-				upgraded.add(with_tls)
 	finished: Dict[ats.Endpoint, ats.Diagnostics] = dict()
 	skipped: Set[ats.Endpoint] = set()
+	upgraded: Set[ats.Endpoint] = set()
 
-	# XXX
-	#pending = {ats.Endpoint(uses_tls=True, host='goo.gl', port=443)}
-	#upgraded = set()
+	# Parse URLs
+	for idx, url in enumerate(urls_path.read_text().splitlines(keepends=False)):
+		if endpoint := ats.Endpoint.from_url(url):
+			if not endpoint.is_relevant:
+				click.secho(f"Skipping irrelevant endpoint: {url}")
+				continue
+			pending.add(endpoint)
+		else:
+			click.secho(f"Invalid endpoint at line {idx}: {url}", fg='red', err=True)
+			exit(1)
 
+	# Add HTTPS variants for HTTP-only URLs
+	if upgrade_scheme:
+		upgraded = {
+			endpoint.with_tls
+			for endpoint in pending
+			if not endpoint.uses_tls and endpoint.with_tls not in pending
+		}
+		pending = pending.union(upgraded)
+
+	# Collect diagnostics
 	with tqdm(
 		desc="Analyzing URLs",
 		total=len(pending),
@@ -816,20 +801,6 @@ def collect_diagnostics(ctx: Context, maap_dir: str, output_dir: str):
 			path = output_path / f'{endpoint.reverse_domain_name}.jsonl'
 			relpath = path.relative_to(output_path)
 
-			if endpoint.is_ip:
-				log_special("  → ", nl=False)
-				log_warn("Not affected by ATS, skipping.")
-				progress.update()
-				skipped.add(endpoint)
-				continue
-
-			if endpoint.is_local:
-				log_special("  → ", nl=False)
-				log_warn("Local domain, skipping.")
-				progress.update()
-				skipped.add(endpoint)
-				continue
-
 			# TODO Append diagnostics, if old results are old enough or if old
 			# result is erroneous and current is not.
 			if path.exists():
@@ -839,6 +810,19 @@ def collect_diagnostics(ctx: Context, maap_dir: str, output_dir: str):
 					d: Dict[str, Any] = json.loads(line)
 					parsed.append(ats.Diagnostics.from_dict(d))
 				existing = DiagnosticResults({x.endpoint: x for x in parsed})
+
+				# Add unfinished or erroneous redirection targets
+				redirections = set(existing.succeeding.redirections.values())
+				redirections -= set(existing.succeeding.endpoints)
+				redirections -= set(finished.keys())
+				redirections -= set(skipped)
+				redirections -= {endpoint}
+				if redirections:
+					pending = pending.union(redirections)
+					progress.reset(total=len(pending) + len(finished) + len(skipped) + 1)
+					progress.update(len(finished) + len(skipped))
+
+				# Skip endpoints that were diagnosed already
 				if endpoint in existing.succeeding.endpoints:
 					log_special("  → ", nl=False)
 					log_warn("Result already exists, skipping.")
@@ -886,100 +870,15 @@ def collect_diagnostics(ctx: Context, maap_dir: str, output_dir: str):
 			click.secho(f"  {endpoint}", fg='red', err=True)
 
 	if upgraded:
-		successful_upgrades = upgraded - failing
-		#failing_upgrades = upgraded.intersection(failing)
 		click.secho("Upgrades: ", bold=True, err=True)
 		for endpoint in sorted(upgraded):
-			if endpoint in successful_upgrades:
-				fg = 'blue'
-			elif endpoint in skipped:
+			if endpoint in skipped:
 				fg = 'yellow'
 			elif endpoint in failing:
 				fg = 'red'
 			else:
-				fg = None
+				fg = 'blue'
 			click.secho(f"  {endpoint}", fg=fg, err=True)
-
-
-@cli.command()
-@click.argument(
-	'maap_dir',
-	type=click.Path(dir_okay=True, file_okay=False, readable=True, writable=True),
-)
-def extract_endpoints(maap_dir: str):
-	apps: List[Tuple[Path, str, str]] = list(maap_walk(Path(maap_dir)))
-	endpoints: Set[ats.Endpoint] = set()
-
-	with tqdm(apps, unit="app", file=sys.stderr, leave=True) as progress:
-		for path, bundle_id, version_id in progress:
-			tqdm_log(progress, f"{bundle_id} / {version_id}")
-
-			endpoints_path = path / 'endpoints.json'
-
-			# Skip existing
-			if endpoints_path.exists():
-				tqdm_log(progress, click.style("\tskipped", fg='yellow'))
-				continue
-
-			def log_error(msg: str, nl: bool = True):
-				tqdm_log(progress, "\t" + click.style(msg, fg='red'))
-
-			endpoints_from_binary: Set[ats.Endpoint] = set()
-			endpoints_from_ats: Set[ats.Endpoint] = set()
-
-			binary_path = path / 'executable.bin'
-			if binary_path.exists():
-				strings = subprocess.run(
-					['strings', '-', '-a', str(binary_path)],
-					check=True,
-					capture_output=True,
-					text=True,
-				)
-				lines = strings.stdout.splitlines(keepends=False)
-				endpoints_from_binary = {
-					endpoint
-					for line in lines
-					for endpoint in ats.Endpoint.find_instances(line, log_error)
-				}
-
-			info_path = path / 'Info.plist'
-			if info_path.exists():
-				with info_path.open('rb') as f:
-					info = plistlib.load(f)
-				if ats_dict := info.get('NSAppTransportSecurity', None):
-
-					# Extract valid domains
-					configuration = ats.Configuration.from_info_plist(ats_dict)
-					for domain, exception in configuration.exceptions.items():
-						endpoint = ats.Endpoint.from_url(f'https://{domain}')
-						assert endpoint is not None
-						endpoints_from_ats.add(endpoint)
-						if exception.includes_subdomains:
-							endpoint = ats.Endpoint.from_url(f'http://{domain}')
-							assert endpoint is not None
-							endpoints_from_ats.add(endpoint)
-
-					# Report invalid domains
-					exception_domains: Dict[str, Any] = ats_dict.get('NSExceptionDomains', dict())
-					for domain in exception_domains.keys():
-						if ats.Endpoint.from_url(f'https://{domain}/') is None:
-							log_error(f"Unexpected endpoint: {domain}")
-
-			result = {
-				'executable': [str(endpoint) for endpoint in sorted(endpoints_from_binary)],
-				'ats': [str(endpoint) for endpoint in sorted(endpoints_from_ats)],
-			}
-			with endpoints_path.open('w') as f:
-				json.dump(result, f, indent=2)
-
-			endpoints_bundle = endpoints_from_binary.union(endpoints_from_ats)
-			tqdm_log(progress, click.style(f"\tFound {len(endpoints_bundle):5d} unique endpoints.", fg='green'))
-			tqdm_log(progress, click.style(f"\t      {pp(len(endpoints_from_binary), len(endpoints_bundle))} in executable", fg='green'))
-			tqdm_log(progress, click.style(f"\t      {pp(len(endpoints_from_ats), len(endpoints_bundle))} in ATS configuration", fg='green'))
-
-			endpoints = endpoints.union(endpoints_bundle)
-
-	click.secho(f"Found {len(endpoints)} unique endpoints in total.", fg='green')
 
 
 @cli.command()
@@ -992,34 +891,191 @@ def extract_endpoints(maap_dir: str):
 	type=click.Path(dir_okay=True, file_okay=False, readable=True),
 )
 def evaluate_configurations(maap_dir: str, diagnostics_dir: str):
-	diagnostics = DiagnosticResults.parse(Path(diagnostics_dir))
-	app_results = AppResults.parse(Path(maap_dir))
-
-	click.secho(f"Apps: {len(app_results.configurations)}", fg='blue', bold=True)
-	click.secho(
-		f"Diagnostics from {diagnostics.date_range[0]} – {diagnostics.date_range[1]}",
-		fg='blue',
-		bold=True,
+	e = Evaluation(
+		dataset=maap.Dataset.from_path(Path(maap_dir)),
+		diagnostics=DiagnosticResults.parse(Path(diagnostics_dir)),
 	)
 
 	# Basic overview of both data sources
-	app_endpoints = {
-		endpoint
-		for endpoints in app_results.endpoints.values()
-		for endpoint in endpoints
-	}
-	app_configurations = list(app_results.configurations.values())
-	d_configurations = list(diagnostics.configurations.values())
+	click.secho(f"Apps: {len(e.dataset.apps)}", fg='blue', bold=True)
+	click.secho(f"Diagnostics from {e.diagnostics.date_range[0]} – {e.diagnostics.date_range[1]}", fg='blue', bold=True)
+	table = Table()
+	endpoint_statistics(e.dataset.endpoints, table, "App")
+	endpoint_statistics(e.diagnostics.endpoints, table, "Diagnostics")
+	#configuration_statistics([app.ats_configuration for app in e.dataset.apps], table, "App")
+	#configuration_statistics(list(e.diagnostics.configurations.values()), table, "Diagnostics")
+	redirection_statistics(e.diagnostics, table, "Diagnostics")
+	table.display()
+
+	# Evaluate possible improvements
+	app_can_improve_explicit: Dict[ats.Improvement, Set[App]] = defaultdict(set)
+	app_can_improve_implicit: Dict[ats.Improvement, Set[App]] = defaultdict(set)
+
+	ep_can_improve_explicit: Dict[ats.Improvement, Set[ats.Endpoint]] = defaultdict(set)
+	ep_can_improve_implicit: Dict[ats.Improvement, Set[ats.Endpoint]] = defaultdict(set)
+	d_can_improve_explicit: Dict[ats.Improvement, Set[str]] = defaultdict(set)
+	d_can_improve_implicit: Dict[ats.Improvement, Set[str]] = defaultdict(set)
+
+	num_implicit_cfgs: int = 0
+	num_explicit_cfgs: int = 0
+
+	explicit_endpoints: Set[ats.Endpoint] = set()
+	implicit_endpoints: Set[ats.Endpoint] = set()
+	explicit_domains: Set[str] = set()
+	implicit_domains: Set[str] = set()
+
+	c_app_explicit: Dict[str, Set[App]] = defaultdict(set)
+	c_app_implicit: Dict[str, Set[App]] = defaultdict(set)
+
+	c_ep_explicit: Dict[str, Set[ats.Endpoint]] = defaultdict(set)
+	c_ep_implicit: Dict[str, Set[ats.Endpoint]] = defaultdict(set)
+	c_d_explicit: Dict[str, Set[str]] = defaultdict(set)
+	c_d_implicit: Dict[str, Set[str]] = defaultdict(set)
+
+	for app, endpoints in e.app_endpoints.items():
+
+		for name, value in [
+			("Arbitrary", app.ats_configuration.arbitrary),
+			("Arbitrary (Media)", app.ats_configuration.arbitrary_media),
+			("Arbitrary (Web)", app.ats_configuration.arbitrary_web),
+		]:
+			if value is None:
+				name = name + " False"
+				c_app_implicit[name].add(app)
+			else:
+				name = name + f" {value}"
+				c_app_explicit[name].add(app)
+
+		if app.ats_configuration.requires_justification:
+			c_app_explicit["Requires justification"].add(app)
+
+		for endpoint in endpoints:
+
+			if not (endpoint.is_relevant and endpoint in e.diagnostics.succeeding.endpoints):
+				continue
+
+			domain, configured = app.ats_configuration[endpoint]
+			host, diagnosed = e.diagnostics.succeeding.configurations[endpoint].get(endpoint.host)
+
+			if domain is None:
+				num_implicit_cfgs += 1
+				implicit_endpoints.add(endpoint)
+				implicit_domains.add(endpoint.host)
+			else:
+				num_explicit_cfgs += 1
+				explicit_endpoints.add(endpoint)
+				explicit_domains.add(domain)
+
+			explicit = ats.Improvement(0)
+			implicit = ats.Improvement(0)
+			if diagnosed is not None:
+
+				if configured is not None:
+					explicit, implicit = configured.compare_to_diagnosed(diagnosed)
+				else:
+					assert app.ats_configuration.any_arbitrary
+					# No exception for endpoint: anything goes
+					# Hence, the diagnosed configuration is compared to the
+					# least secure configuration. Since the configuration was
+					# not actually read from file, all improvements are implicit.
+					least_secure = ats.ActualDomainConfiguration.least_secure()
+					implicit, _ = least_secure.compare_to_diagnosed(diagnosed)
+
+			# Normalize
+			if endpoint.uses_tls:
+				explicit = explicit.https
+				implicit = implicit.https
+			else:
+				explicit = explicit.http
+				implicit = implicit.http
+
+			if configured:
+				for name_true, name_false, value, default in [
+					("HTTP allowed", "HTTP prohibited", configured.http, False),
+					("FS required", "FS optional", configured.fs, True),
+					("CT required", "CT optional", configured.ct, False),
+				]:
+					if value is not None:
+						name = name_true if value else name_false
+						c_app_explicit[name].add(app)
+						c_ep_explicit[name].add(endpoint)
+						c_d_explicit[name].add(domain if domain else endpoint.host)
+					if value is None:
+						name = name_true if default else name_false
+						c_app_implicit[name].add(app)
+						c_ep_implicit[name].add(endpoint)
+						c_d_implicit[name].add(domain if domain else endpoint.host)
+				if tls := configured.tls:
+					name = f"Min {tls}"
+					c_app_explicit[name].add(app)
+					c_ep_explicit[name].add(endpoint)
+					c_d_explicit[name].add(domain if domain else endpoint.host)
+				if configured.tls is None:
+					name = f"Min {ats.TlsVersion.TLSv1_2}"
+					c_app_implicit[name].add(app)
+					c_ep_implicit[name].add(endpoint)
+					c_d_implicit[name].add(domain if domain else endpoint.host)
+				if configured.requires_justification:
+					name = "Requires justification"
+					c_ep_explicit[name].add(endpoint)
+					c_d_explicit[name].add(domain if domain else endpoint.host)
+			else:
+				assert app.ats_configuration.any_arbitrary
+				name = "Arbitrary w/o exception"
+				c_app_implicit[name].add(app)
+				c_ep_implicit[name].add(endpoint)
+				c_d_implicit[name].add(domain if domain else endpoint.host)
+
+			for improvement in ats.Improvement:
+				if improvement in implicit:
+					app_can_improve_implicit[improvement].add(app)
+					ep_can_improve_implicit[improvement].add(endpoint)
+					d_can_improve_implicit[improvement].add(domain if domain else endpoint.host)
+				if improvement in explicit:
+					app_can_improve_explicit[improvement].add(app)
+					ep_can_improve_explicit[improvement].add(endpoint)
+					d_can_improve_explicit[improvement].add(domain if domain else endpoint.host)
 
 	table = Table()
 
-	endpoint_statistics(app_endpoints, table, column="App")
-	endpoint_statistics(diagnostics.endpoints, table, column="Diagnostics")
+	# Applications
+	keys = sorted(set(c_app_explicit.keys()).union(c_app_implicit.keys()))
+	grp = table.add_group("Applications", len(e.dataset.apps), "Explicit")
+	for key in keys:
+		table.add_row(grp, key, len(c_app_explicit[key]), "Explicit")
+	for improvement in ats.Improvement.explicit():
+		table.add_row(grp, str(improvement), len(app_can_improve_explicit[improvement]), "Explicit")
+	grp = table.add_group(grp, len(e.dataset.apps), "Implicit")
+	for key in keys:
+		table.add_row(grp, key, len(c_app_implicit[key]), "Implicit")
+	for improvement in ats.Improvement.implicit():
+		table.add_row(grp, str(improvement), len(app_can_improve_implicit[improvement]), "Implicit")
 
-	configuration_statistics(app_configurations, table, column="App")
-	configuration_statistics(d_configurations, table, column="Diagnostics")
+	# Endpoints
+	keys = sorted(set(c_ep_explicit.keys()).union(c_ep_implicit.keys()))
+	grp = table.add_group("Endpoints", len(explicit_endpoints), "Explicit")
+	for key in keys:
+		table.add_row(grp, key, len(c_ep_explicit[key]), "Explicit")
+	for improvement in ats.Improvement.explicit():
+		table.add_row(grp, str(improvement), len(ep_can_improve_explicit[improvement]), "Explicit")
+	grp = table.add_group(grp, len(implicit_endpoints), "Implicit")
+	for key in keys:
+		table.add_row(grp, key, len(c_ep_implicit[key]), "Implicit")
+	for improvement in ats.Improvement.implicit():
+		table.add_row(grp, str(improvement), len(ep_can_improve_implicit[improvement]), "Implicit")
 
-	redirection_statistics(diagnostics, table, column="Diagnostics")
+	# Domains
+	keys = sorted(set(c_d_explicit.keys()).union(c_d_implicit.keys()))
+	grp = table.add_group("Domains", len(explicit_domains), "Explicit")
+	for key in keys:
+		table.add_row(grp, key, len(c_d_explicit[key]), "Explicit")
+	for improvement in ats.Improvement.explicit():
+		table.add_row(grp, str(improvement), len(d_can_improve_explicit[improvement]), "Explicit")
+	grp = table.add_group(grp, len(implicit_domains), "Implicit")
+	for key in keys:
+		table.add_row(grp, key, len(c_d_implicit[key]), "Implicit")
+	for improvement in ats.Improvement.implicit():
+		table.add_row(grp, str(improvement), len(d_can_improve_implicit[improvement]), "Implicit")
 
 	table.display()
 	return
@@ -1065,6 +1121,21 @@ def evaluate_diagnostics(diagnostics_dir: str):
 	failure_statistics(failing, table, "Failing")
 
 	table.display()
+
+
+@cli.command()
+@click.argument(
+	'maap_dir',
+	type=click.Path(dir_okay=True, file_okay=False, readable=True, writable=True),
+)
+def print_endpoints(maap_dir: str):
+	dataset = maap.Dataset.from_path(Path(maap_dir), all_versions=True)
+
+	for app in tqdm(dataset.apps, unit='app', file=sys.stderr):
+		tqdm.write(str(app), file=sys.stderr)
+		for endpoint in app.endpoints:
+			if endpoint.is_relevant:
+				click.echo(endpoint)
 
 
 @cli.group()

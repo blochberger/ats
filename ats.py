@@ -323,6 +323,10 @@ class Endpoint:
 		return is_ip(self.host)
 
 	@property
+	def is_relevant(self) -> bool:
+		return not (self.is_ip or self.is_local)
+
+	@property
 	def reverse_domain_name(self) -> str:
 		if self.is_ip:
 			return self.host
@@ -347,10 +351,9 @@ class Endpoint:
 	def __lt__(self, other: Any) -> bool:
 		if type(other) is not Endpoint:
 			raise TypeError
-		return (
-			self.reverse_domain_name < other.reverse_domain_name or
-			(self.reverse_domain_name == other.reverse_domain_name and self.port < other.port)
-		)
+		return (self.reverse_domain_name < other.reverse_domain_name or (
+			self.reverse_domain_name == other.reverse_domain_name and self.port < other.port
+		))
 
 	def __le__(self, other: Any) -> bool:
 		return self == other or self < other
@@ -370,7 +373,11 @@ class Endpoint:
 
 	@classmethod
 	def from_url(cls, url: str) -> Optional['Endpoint']:
-		parsed = urlparse(url)
+		try:
+			parsed = urlparse(url)
+		except ValueError:
+			return None
+
 		host = parsed.hostname
 		if host is None:
 			return None
@@ -437,6 +444,40 @@ class Endpoint:
 			if endpoint := emit_candidate(value, scheme_end, log_error):
 				yield endpoint
 			break
+
+
+class Improvement(enum.Flag):
+	CanDisableHTTP = enum.auto()
+	CanUpgradeTLS = enum.auto()
+	CanEnableFS = enum.auto()
+	CanEnableCT = enum.auto()
+
+	RemovesJustification = enum.auto()
+
+	@property
+	def http(self) -> 'Improvement':
+		cls = self.__class__
+		return self & (cls.CanDisableHTTP | cls.RemovesJustification)
+
+	@property
+	def https(self) -> 'Improvement':
+		cls = self.__class__
+		return self & (cls.CanUpgradeTLS | cls.CanEnableFS | cls.CanEnableCT | cls.RemovesJustification)
+
+	def __str__(self) -> str:
+		value = re.sub(r'([A-Z][a-z])', r' \1', self.name)
+		value = re.sub(r'([a-z])([A-Z])', r'\1 \2', self.name)
+		return value.strip()
+
+	@classmethod
+	def implicit(cls) -> Iterator['Improvement']:
+		for flag in cls:
+			if flag in (cls.CanEnableCT | cls.CanUpgradeTLS):
+				yield flag
+
+	@classmethod
+	def explicit(cls) -> Iterator['Improvement']:
+		return iter(cls)
 
 
 @dataclass(frozen=True)
@@ -557,21 +598,6 @@ class DomainConfiguration:
 
 		return result
 
-	def merged(self, other: 'DomainConfiguration') -> 'DomainConfiguration':
-		includes_subdomains = self.includes_subdomains or other.includes_subdomains
-		insecure_http_loads = self.insecure_http_loads or other.insecure_http_loads
-		tls_version = min([self.tls_version, other.tls_version])
-		forward_secrecy = self.forward_secrecy and other.forward_secrecy
-		certificate_transparency = self.certificate_transparency and other.certificate_transparency
-
-		return self.__class__(
-			includes_subdomains=includes_subdomains,
-			insecure_http_loads=insecure_http_loads,
-			tls_version=tls_version,
-			forward_secrecy=forward_secrecy,
-			certificate_transparency=certificate_transparency,
-		)
-
 	def ats_dict(self, simplify: bool = True) -> Dict[str, Any]:
 		default = self.__class__()
 
@@ -638,58 +664,6 @@ class DomainConfiguration:
 			certificate_transparency=certificate_transparency,
 		)
 
-	@classmethod
-	def from_info_plist(cls, ats_dict: Dict[str, Any]) -> 'DomainConfiguration':
-		default = cls()
-
-		includes_subdomains = get_bool(
-			ats_dict,
-			'NSIncludesSubdomains',
-			default.includes_subdomains,
-			strict=False,
-		)
-
-		def get_bool_respecting_variants(key: str, default: bool) -> bool:
-			for variant, is_deprecated in key_variants(key):
-				value = get_bool(ats_dict, variant, default, strict=False)
-				if variant in ats_dict and value:
-					return value
-			return default
-
-		insecure_http_loads = get_bool_respecting_variants(
-			'NSExceptionAllowsInsecureHTTPLoads',
-			default.insecure_http_loads,
-		)
-
-		forward_secrecy = get_bool_respecting_variants(
-			'NSExceptionRequiresForwardSecrecy',
-			default.forward_secrecy,
-		)
-
-		tls_version: TlsVersion
-		for variant, is_deprecated in key_variants('NSExceptionMinimumTLSVersion'):
-			value_str = get_str(ats_dict, variant, str(default.tls_version), strict=False)
-			value = TlsVersion.from_str(value_str)
-			if variant in ats_dict and value is not None:
-				tls_version = value
-				break
-			tls_version = default.tls_version
-
-		certificate_transparency = get_bool(
-			ats_dict,
-			'NSRequiresCertificateTransparency',
-			default.certificate_transparency,
-			strict=False,
-		)
-
-		return cls(
-			includes_subdomains=includes_subdomains,
-			insecure_http_loads=insecure_http_loads,
-			tls_version=tls_version,
-			forward_secrecy=forward_secrecy,
-			certificate_transparency=certificate_transparency,
-		)
-
 
 @dataclass(frozen=True)
 class Configuration:
@@ -725,70 +699,27 @@ class Configuration:
 		reflect actual App Review decisions and is subject to change.
 		"""
 
-		if self.arbitrary_loads:
-			return True
-
-		return any(
+		return self.arbitrary_loads or any(
 			exception.requires_justification
 			for exception in self.exceptions.values()
 		)
 
-	def __contains__(self, key: Any) -> bool:
-		try:
-			self[key]
-			return True
-		except KeyError:
-			return False
-
-	def __getitem__(self, key: Any) -> Tuple[Optional[str], DomainConfiguration]:
-
-		host: str
-		if type(key) is str:
-			host = key
-		elif type(key) is Endpoint:
-			host = key.host
-		else:
-			raise TypeError
-
-		if is_ip(host):
-			# Host is not affected by ATS
-			raise KeyError
-
-		# Check whether host is subdomain of any exception domain and whether
-		# that exception domain's configuration includes subdomains.
+	def exception_domain_for(self, host: str) -> Optional[str]:
 		for domain, exception in self.exceptions.items():
-			if domain == host or (is_subdomain(host, domain) and exception.includes_subdomains):
-				return (domain, exception)
+			if domain == host or (
+				is_subdomain(host, domain) and exception.includes_subdomains
+			):
+				return domain
+		return None
 
-		# No domain configuration for the given key
+	def get(self, host: str) -> Tuple[Optional[str], Optional[DomainConfiguration]]:
+		if domain := self.exception_domain_for(host):
+			return (domain, self.exceptions[domain])
 
 		if not self.arbitrary_loads:
-			# If ATS is not disabled, the default configuration applies to
-			# unknown hosts.
 			return (None, DomainConfiguration())
 
-		raise KeyError
-
-	def for_endpoint(self, endpoint: Endpoint) -> 'Configuration':
-		default = self.__class__()
-
-		exceptions: Dict[str, DomainConfiguration] = dict()
-		if endpoint in self:
-			domain, exception = self[endpoint]
-			if domain is not None:
-				# Normalize
-				if not all([
-					self.arbitrary_loads == default.arbitrary_loads,
-					self.local_networking == default.local_networking,
-					exception.is_default,
-				]):
-					exceptions = {domain: exception}
-
-		return self.__class__(
-			arbitrary_loads=self.arbitrary_loads,
-			local_networking=self.local_networking,
-			exceptions=exceptions,
-		)
+		return (None, None)
 
 	def __str__(self) -> str:
 		return unstyle(self.display())
@@ -823,37 +754,6 @@ class Configuration:
 			result += "=" + style("Default", fg='green')
 
 		return result
-
-	def merged(self, other: 'Configuration') -> 'Configuration':
-		arbitrary_loads = self.arbitrary_loads or other.arbitrary_loads
-		local_networking = self.local_networking or other.local_networking
-		exceptions = self.exceptions
-
-		for domain, exception in other.exceptions.items():
-			if domain not in exceptions:
-				exceptions[domain] = exception
-				continue
-
-			exceptions[domain] = exceptions[domain].merged(exception)
-
-		return self.__class__(
-			arbitrary_loads=arbitrary_loads,
-			local_networking=local_networking,
-			exceptions=exceptions,
-		)
-
-	def split(self) -> List['Configuration']:
-		if len(self.exceptions) <= 1:
-			return [self]
-
-		results: List['Configuration'] = []
-		for domain, exception in self.exceptions.items():
-			results.append(self.__class__(
-				arbitrary_loads=self.arbitrary_loads,
-				local_networking=self.local_networking,
-				exceptions={domain: exception},
-			))
-		return results
 
 	def ats_dict(self, simplify: bool = True) -> Dict[str, Dict[str, Any]]:
 		configuration: Dict[str, Any] = dict()
@@ -900,51 +800,181 @@ class Configuration:
 			exceptions=exceptions,
 		)
 
-	@classmethod
-	def from_info_plist(cls, ats_dict: Dict[str, Any]) -> 'Configuration':
-		default = cls()
 
-		# TODO Handle version specifics:
-		# https://developer.apple.com/documentation/bundleresources/information_property_list/nsapptransportsecurity
+@dataclass(frozen=True)
+class ActualDomainConfiguration:
+	includes_subdomains: bool = False
+	http: Optional[bool] = None
+	fs: Optional[bool] = None
+	ct: Optional[bool] = None
+	tls: Optional[TlsVersion] = None
 
-		arbitrary_loads = any([
-			get_bool(
-				ats_dict,
-				'NSAllowsArbitraryLoads',
-				default.arbitrary_loads,
-				strict=False,
-			),
-			get_bool(
-				ats_dict,
-				'NSAllowsArbitraryLoadsForMedia',
-				default.arbitrary_loads,
-				strict=False,
-			),
-			get_bool(
-				ats_dict,
-				'NSAllowsArbitraryLoadsInWebContent',
-				default.arbitrary_loads,
-				strict=False,
-			),
+	def compare_to_diagnosed(
+		self,
+		other: DomainConfiguration,
+	) -> Tuple[Improvement, Improvement]:
+		explicit = Improvement(0)
+		implicit = Improvement(0)
+
+		if not other.insecure_http_loads and self.http is not None and self.http:
+			explicit |= Improvement.CanDisableHTTP
+
+		if other.forward_secrecy and self.fs is not None and not self.fs:
+			explicit |= Improvement.CanEnableFS
+
+		if other.certificate_transparency and self.ct is None:
+			implicit |= Improvement.CanEnableCT
+
+		if other.certificate_transparency and self.ct is not None and not self.ct:
+			explicit |= Improvement.CanEnableCT
+
+		if self.tls is None and TlsVersion.TLSv1_2 < other.tls_version:
+			implicit |= Improvement.CanUpgradeTLS
+
+		if self.tls is not None and self.tls < other.tls_version:
+			explicit |= Improvement.CanUpgradeTLS
+
+		if self.requires_justification and not other.requires_justification:
+			explicit |= Improvement.RemovesJustification
+
+		assert all(improvement not in (implicit & explicit) for improvement in Improvement)
+
+		return (explicit, implicit)
+
+	@property
+	def requires_justification(self) -> bool:
+		return any([
+			self.http is not None and self.http,
+			self.tls is not None and self.tls < TlsVersion.TLSv1_2,
 		])
 
-		local_networking = get_bool(
-			ats_dict,
-			'NSAllowsLocalNetworking',
-			default.local_networking,
-			strict=False,
+	@classmethod
+	def least_secure(cls) -> 'ActualDomainConfiguration':
+		return cls(
+			includes_subdomains=False,
+			http=True,
+			fs=False,
+			ct=False,
+			tls=TlsVersion.TLSv1_0,
 		)
 
-		exception_domains = get_dict(ats_dict, 'NSExceptionDomains', dict(), strict=False)
-		exceptions: Dict[str, DomainConfiguration] = dict()
-		for domain, exception_ats_dict in exception_domains.items():
-			if not is_valid_host(domain):
-				continue
-			exceptions[domain] = DomainConfiguration.from_info_plist(exception_ats_dict)
+	@classmethod
+	def from_ats_dict(cls, ats_dict: Dict[str, Any]) -> 'ActualDomainConfiguration':
+		includes_subdomains = get_bool(ats_dict, 'NSIncludesSubdomains', False, strict=False)
+
+		http: Optional[bool] = None
+		for key, is_deprecated in key_variants('NSExceptionAllowsInsecureHTTPLoads'):
+			if value := ats_dict.get(key, None):
+				if type(value) is bool:
+					http = value
+					break
+
+		fs: Optional[bool] = None
+		for key, is_deprecated in key_variants('NSExceptionRequiresForwardSecrecy'):
+			if value := ats_dict.get(key, None):
+				if type(value) is bool:
+					fs = value
+					break
+
+		ct: Optional[bool] = None
+		if value := ats_dict.get('NSRequiresCertificateTransparency', None):
+			if type(value) is bool:
+				ct = value
+
+		tls: Optional[TlsVersion] = None
+		for key, is_deprecated in key_variants('NSExceptionMinimumTLSVersion'):
+			if raw := ats_dict.get(key, None):
+				if type(raw) is str:
+					try:
+						tls = TlsVersion.from_str(raw)
+						break
+					except ValueError:
+						pass
 
 		return cls(
-			arbitrary_loads=arbitrary_loads,
-			local_networking=local_networking,
+			includes_subdomains=includes_subdomains,
+			http=http,
+			fs=fs,
+			ct=ct,
+			tls=tls,
+		)
+
+
+@dataclass(frozen=True)
+class ActualConfiguration:
+	arbitrary: Optional[bool] = None
+	arbitrary_media: Optional[bool] = None
+	arbitrary_web: Optional[bool] = None
+	exceptions: Dict[str, ActualDomainConfiguration] = field(default_factory=dict)
+
+	@property
+	def any_arbitrary(self) -> bool:
+		return any([
+			self.arbitrary is not None and self.arbitrary,
+			self.arbitrary_media is not None and self.arbitrary_media,
+			self.arbitrary_web is not None and self.arbitrary_web,
+		])
+
+	@property
+	def requires_justification(self) -> bool:
+		return self.any_arbitrary or any(
+			exception.requires_justification
+			for exception in self.exceptions.values()
+		)
+
+	def exception_domain_for(self, host: str) -> Optional[str]:
+		for domain, exception in self.exceptions.items():
+			if domain == host or (
+				exception.includes_subdomains and is_subdomain(host, domain)
+			):
+				return domain
+		return None
+
+	def __getitem__(self, key: Any) -> Tuple[Optional[str], Optional[ActualDomainConfiguration]]:
+		if type(key) is str:
+			host = key
+		elif type(key) is Endpoint:
+			host = key.host
+		else:
+			raise TypeError
+
+		if domain := self.exception_domain_for(host):
+			return (domain, self.exceptions[domain])
+
+		if not self.any_arbitrary:
+			return (None, ActualDomainConfiguration())
+
+		# Anything goes
+		return (None, None)
+
+	@classmethod
+	def from_ats_dict(cls, ats_dict: Dict[str, Any]) -> 'ActualConfiguration':
+		arbitrary: Optional[bool] = None
+		if value := ats_dict.get('NSAllowsArbitraryLoads', None):
+			if type(value) is bool:
+				arbitrary = value
+
+		arbitrary_media: Optional[bool] = None
+		if value := ats_dict.get('NSAllowsArbitraryLoadsForMedia', None):
+			if type(value) is bool:
+				arbitrary_media = value
+
+		arbitrary_web: Optional[bool] = None
+		if value := ats_dict.get('NSAllowsArbitraryLoadsForWebContent', None):
+			if type(value) is bool:
+				arbitrary_web = value
+
+		exceptions: Dict[str, ActualDomainConfiguration] = dict()
+		if eds_dict := ats_dict.get('NSExceptionDomains', None):
+			if type(eds_dict) is dict:
+				for domain, ed_dict in eds_dict.items():
+					if type(ed_dict) is dict:
+						exceptions[domain] = ActualDomainConfiguration.from_ats_dict(ed_dict)
+
+		return cls(
+			arbitrary=arbitrary,
+			arbitrary_media=arbitrary_media,
+			arbitrary_web=arbitrary_web,
 			exceptions=exceptions,
 		)
 
@@ -1024,6 +1054,7 @@ class Diagnostics:
 			timestamp = timestamp_from_str(timestamp_str)
 			if timestamp is None:
 				raise ValueError(f"Invalid timestamp: {timestamp}")
+		assert timestamp is not None
 
 		error: Optional[Dict[str, Any]] = data.get('error', None)
 
