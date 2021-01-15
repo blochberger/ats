@@ -1,6 +1,6 @@
 import Foundation
 
-let data = FileHandle.standardInput.availableData
+let data = FileHandle.standardInput.readDataToEndOfFile()
 
 let plist = try PropertyListSerialization.propertyList(from: data, options: [], format: nil)
 
