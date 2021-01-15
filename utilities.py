@@ -1,10 +1,12 @@
 import enum
+import plistlib
 import re
 import subprocess
 
 from dataclasses import dataclass
 from pathlib import Path
 from typing import List, Optional, Type, TypeVar
+from xml.parsers.expat import ExpatError
 
 
 U = TypeVar('U', bound='Utility')
@@ -247,6 +249,42 @@ class Utility:
 @dataclass
 class PlistSanitizer(Utility):
 
+	def load(self, plist: Path) -> dict:
+		assert self.is_ready
+
+		assert plist.exists()
+
+		raw = plist.read_bytes()
+
+		try:
+			return plistlib.loads(raw)
+		except plistlib.InvalidFileException:
+			pass
+		except ExpatError:
+			pass
+		except ValueError:
+			pass
+
+		# Try sanitizing input
+		intermediate = subprocess.run(
+			[str(self.path)],
+			input=raw,
+			capture_output=True,
+			check=True
+		)
+		sanitized = intermediate.stdout
+		return plistlib.loads(sanitized)
+
 	@classmethod
 	def name(self) -> str:
 		return 'plsan'
+
+	@classmethod
+	def default(cls) -> 'PlistSanitizer':
+		target_path = cls.default_target_path()
+		assert target_path.exists(), "Please call `ats compile`"
+		return cls(
+			path=target_path,
+			_intermediate=None,
+			_state=State.Ready,
+		)
