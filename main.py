@@ -326,8 +326,6 @@ class DiagnosticResults:
 			if not entry.suffix == '.jsonl':
 				continue
 
-			#click.secho(entry.stem, dim=True)
-
 			lines = entry.read_text().splitlines(keepends=False)
 			for line in lines:
 				d: Dict[str, Any] = json.loads(line)
