@@ -347,6 +347,8 @@ class Endpoint:
 			return Certificate.from_pem(pem)
 		except ssl.SSLError:
 			return None
+		except ConnectionResetError:
+			return None
 
 	def __lt__(self, other: Any) -> bool:
 		if type(other) is not Endpoint:
