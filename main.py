@@ -3,7 +3,7 @@ import sys
 
 from collections import defaultdict
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from functools import cached_property
 from pathlib import Path
 from time import sleep
@@ -822,13 +822,16 @@ def collect_diagnostics(
 					progress.reset(total=len(pending) + len(finished) + len(skipped) + 1)
 					progress.update(len(finished) + len(skipped))
 
-				# Skip endpoints that were diagnosed already
-				if endpoint in existing.succeeding.endpoints:
-					log_special("  → ", nl=False)
-					log_warn("Result already exists, skipping.")
-					progress.update()
-					skipped.add(endpoint)
-					continue
+				# Skip endpoints that were diagnosed recently
+				if endpoint in existing.diagnostics:
+					diagnostics = existing.diagnostics[endpoint]
+					age = datetime.now(timezone.utc) - diagnostics.timestamp
+					if age < timedelta(days=7):
+						log_special("  → ", nl=False)
+						log_warn("Recent result exists, skipping.")
+						progress.update()
+						skipped.add(endpoint)
+						continue
 
 			diagnostics = ats.find_best_configuration(
 				endpoint=endpoint,
