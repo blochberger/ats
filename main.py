@@ -742,6 +742,15 @@ def collect_diagnostics(
 	output_dir: str,
 	urls_file: Tuple[str, ...],
 ):
+	ignored = {
+		# Crashes `atsprobe` utility
+		'www.sno.phy.queensu.ca',
+		'microwaveformac.com',
+		'mymovies.dk',
+		# Time out
+		'blog.codeobsession.com',
+	}
+
 	output_path = Path(output_dir)
 	output_path.mkdir(parents=True, exist_ok=True)
 
@@ -797,6 +806,16 @@ def collect_diagnostics(
 		while pending:
 			endpoint = pending.pop()
 			log_info(click.style(f"{endpoint}", bold=True))
+
+			if any([
+				endpoint.host == domain or ats.is_subdomain(endpoint.host, domain)
+				for domain in ignored
+			]):
+				log_special("  → ", nl=False)
+				log_warn("Result is ignored, skipping.")
+				progress.update()
+				skipped.add(endpoint)
+				continue
 
 			path = output_path / f'{endpoint.reverse_domain_name}.jsonl'
 			relpath = path.relative_to(output_path)
