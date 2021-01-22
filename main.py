@@ -725,22 +725,23 @@ def determine(ctx: Context, url_: str):
 	show_default=True,
 )
 @click.argument(
-	'urls_file',
-	type=click.Path(dir_okay=False, file_okay=True, readable=True),
-)
-@click.argument(
 	'output_dir',
 	type=click.Path(file_okay=False, dir_okay=True, readable=True, writable=True),
+	required=True,
+)
+@click.argument(
+	'urls_file',
+	type=click.Path(dir_okay=False, file_okay=True, readable=True),
+	nargs=-1,
 	required=True,
 )
 @click.pass_obj
 def collect_diagnostics(
 	ctx: Context,
 	upgrade_scheme: bool,
-	urls_file: str,
 	output_dir: str,
+	urls_file: Tuple[str, ...],
 ):
-	urls_path = Path(urls_file)
 	output_path = Path(output_dir)
 	output_path.mkdir(parents=True, exist_ok=True)
 
@@ -750,15 +751,16 @@ def collect_diagnostics(
 	upgraded: Set[ats.Endpoint] = set()
 
 	# Parse URLs
-	for idx, url in enumerate(urls_path.read_text().splitlines(keepends=False)):
-		if endpoint := ats.Endpoint.from_url(url):
-			if not endpoint.is_relevant:
-				click.secho(f"Skipping irrelevant endpoint: {url}")
-				continue
-			pending.add(endpoint)
-		else:
-			click.secho(f"Invalid endpoint at line {idx}: {url}", fg='red', err=True)
-			exit(1)
+	for path in [Path(fn) for fn in urls_file]:
+		for idx, url in enumerate(path.read_text().splitlines(keepends=False)):
+			if endpoint := ats.Endpoint.from_url(url):
+				if not endpoint.is_relevant:
+					click.secho(f"Skipping irrelevant endpoint in '{path}': {url}")
+					continue
+				pending.add(endpoint)
+			else:
+				click.secho(f"Invalid endpoint in '{path}' at line {idx}: {url}", fg='red', err=True)
+				exit(1)
 
 	# Add HTTPS variants for HTTP-only URLs
 	if upgrade_scheme:
