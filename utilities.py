@@ -251,10 +251,15 @@ class PlistSanitizer(Utility):
 
 	def load(self, plist: Path) -> dict:
 		assert self.is_ready
-
 		assert plist.exists()
 
-		raw = plist.read_bytes()
+		return self.loads(plist.read_bytes())
+
+	def loads(self, raw: bytes) -> dict:
+		assert self.is_ready
+
+		if not raw:
+			return dict()
 
 		try:
 			return plistlib.loads(raw)

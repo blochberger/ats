@@ -1,4 +1,5 @@
 import json
+import pickle
 import sys
 
 from collections import defaultdict
@@ -7,10 +8,14 @@ from datetime import datetime, timedelta, timezone
 from functools import cached_property
 from pathlib import Path
 from time import sleep
-from typing import Any, Dict, List, Optional, Set, Tuple
+from typing import Any, Callable, Dict, List, Optional, Set, Tuple, TypeVar
 
 import click
+import lief
+import matplotlib
+import matplotlib.pyplot as plt
 
+from matplotlib.patches import Patch
 from natsort import natsorted
 from tqdm import tqdm
 from tqdm._utils import _term_move_up as term_move_up
@@ -28,7 +33,38 @@ from utilities import (
 from tests import TestEnvironment
 
 
+T = TypeVar('T')
+
+
 _tqdm_buf = ''
+
+
+# Setup plots
+matplotlib.rcParams['text.usetex'] = True
+matplotlib.rcParams['text.latex.preamble'] = r'''
+	\usepackage[tt=false,type1=true]{libertine}
+	\usepackage[libertine]{newtxmath}
+	\usepackage{inconsolata}
+'''
+
+
+class Tomorrow:
+	base00 = '#ffffff'
+	base01 = '#e0e0e0'
+	base02 = '#d6d6d6'
+	base03 = '#8e908c'
+	base04 = '#969896'
+	base05 = '#4d4d4c'
+	base06 = '#282a2e'
+	base07 = '#1d1f21'
+	base08 = '#c82829'  # red
+	base09 = '#f5871f'  # orange
+	base0A = '#eab700'  # yellow
+	base0B = '#718c00'  # green
+	base0C = '#3e999f'  # turqoise
+	base0D = '#4271ae'  # blue
+	base0E = '#8959a8'  # purple
+	base0F = '#a3685a'  # brown
 
 
 def tqdm_log(progress: tqdm, msg: str, nl: bool = True):
@@ -56,6 +92,46 @@ def percentage(value: int, total: int) -> float:
 
 def pp(value: int, total: int) -> str:
 	return f"{value:5d} ({percentage(value, total):6.2f} %)"
+
+
+def month_marker(value: datetime) -> str:
+	date = value.date()
+	return f"{date.year:4d}-{date.month:02d}"
+
+
+def cumulate_sets(values: Dict[str, Set[T]], keys: List[str]) -> Dict[str, Set[T]]:
+	results: Dict[str, Set[T]] = dict()
+	previous: Set[T] = set()
+	for key in keys:
+		current = values.get(key, set())
+		results[key] = previous.union(current)
+		previous = results[key]
+	return results
+
+
+def percentages(values: List[int], totals: List[int]) -> List[float]:
+	assert len(values) == len(totals)
+	return [percentage(value, total) for value, total in zip(values, totals)]
+
+
+def dmap(
+	func: Callable[[T, T], T],
+	lhs: Dict[str, T],
+	rhs: Dict[str, T],
+	default: Callable[[], T],
+) -> Dict[str, T]:
+	return {
+		key: func(lhs.get(key, default()), rhs.get(key, default()))
+		for key in set(lhs.keys()).union(rhs.keys())
+	}
+
+
+def dmap_set(
+	func: Callable[[Set[T], Set[T]], Set[T]],
+	lhs: Dict[str, Set[T]],
+	rhs: Dict[str, Set[T]],
+) -> Dict[str, Set[T]]:
+	return dmap(func, lhs, rhs, default=set)
 
 
 @dataclass
@@ -373,7 +449,7 @@ class Evaluation:
 def endpoint_statistics(
 	endpoints: Set[ats.Endpoint],
 	table: Table,
-	column: str = ''
+	column: str = '',
 ):
 	with_standard_port = {
 		endpoint for endpoint in endpoints if endpoint.has_standard_port
@@ -420,11 +496,11 @@ def redirection_statistics(
 		for path in diagnostics.transitive_redirections
 		if not path[0].uses_tls and path[-1].uses_tls
 	]
-	t_to_http = [
-		path
-		for path in diagnostics.transitive_redirections
-		if path[0].uses_tls and not path[-1].uses_tls
-	]
+#	t_to_http = [
+#		path
+#		for path in diagnostics.transitive_redirections
+#		if path[0].uses_tls and not path[-1].uses_tls
+#	]
 	pure_https = [
 		path
 		for path in diagnostics.transitive_redirections
@@ -451,126 +527,124 @@ def redirection_statistics(
 		if not http_in_suffix:
 			http_prefix.append(path)
 
-	grp = table.add_group("Redirections", len(diagnostics.redirections), column)
+	grp = table.add_group("Direct Redirections", len(diagnostics.redirections), column)
 	table.add_row(grp, "HTTP -> HTTPS", len(to_https), column)
 	table.add_row(grp, "HTTP -> HTTPS (same host)", len(https_upgrade), column)
 	table.add_row(grp, "HTTPS -> HTTP", len(to_http), column)
 
+	contains_https_to_http = len(diagnostics.transitive_redirections) - len(pure_https) - len(pure_http) - len(http_prefix)
+
 	grp = table.add_group("Transitive redirections", len(diagnostics.transitive_redirections), column)
 	table.add_row(grp, "pure HTTPS", len(pure_https), column)
 	table.add_row(grp, "HTTP -> HTTPS (upgrade only)", len(http_prefix), column)
-	table.add_row(grp, "HTTP -> HTTPS", len(t_to_https), column)
-	table.add_row(grp, "HTTPS -> HTTP", len(t_to_http), column)
+	table.add_row(grp, "contains HTTPS -> HTTP", contains_https_to_http, column)
 	table.add_row(grp, "pure HTTP", len(pure_http), column)
+	#table.add_row(grp, "HTTP -> HTTPS", len(t_to_https), column)
+	#table.add_row(grp, "HTTPS -> HTTP", len(t_to_http), column)
 
 
 def configuration_statistics(
-	configurations: List[ats.Configuration],
+	configurations: Dict[ats.Endpoint, ats.Configuration],
 	table: Table,
 	column: str = ''
 ):
-	global_requires_justification = [
-		configuration
-		for configuration in configurations
-		if configuration.requires_justification
-	]
-	global_non_default = [
-		configuration
-		for configuration in configurations
-		if not configuration.is_default
-	]
-	no_ats = [
-		configuration
-		for configuration in configurations
-		if not configuration.arbitrary_loads and 0 == len(configuration.exceptions)
-	]
-	no_ats_with_exceptions = [
-		configuration
-		for configuration in configurations
-		if not configuration.arbitrary_loads and 0 < len(configuration.exceptions)
-	]
+	global_requires_justification = 0
+	global_non_default = 0
+	arbitrary = 0
 
-	domain_configurations = [
-		(domain, domain_configuration)
-		for configuration in configurations
-		for domain, domain_configuration in configuration.exceptions.items()
-	]
-
-	non_default = [
-		(domain, configuration)
-		for domain, configuration in domain_configurations
-		if not configuration.is_default
-	]
-	most_secure = [
-		(domain, configuration)
-		for domain, configuration in domain_configurations
-		if configuration == ats.DomainConfiguration.most_secure()
-	]
-	more_secure = [
-		(domain, configuration)
-		for domain, configuration in domain_configurations
-		if ats.DomainConfiguration() < configuration
-	]
-	less_secure = [
-		(domain, configuration)
-		for domain, configuration in domain_configurations
-		if configuration < ats.DomainConfiguration()
-	]
-	mixed = [
-		(domain, configuration)
-		for domain, configuration in domain_configurations
-		if not any([
-			configuration < ats.DomainConfiguration(),
-			configuration > ats.DomainConfiguration(),
-		])
-	]
-	requires_justification = [
-		(domain, configuration)
-		for domain, configuration in domain_configurations
-		if configuration.requires_justification
-	]
-
-	http = [
-		(domain, configuration)
-		for domain, configuration in domain_configurations
-		if configuration.insecure_http_loads
-	]
-	fs = [
-		(domain, configuration)
-		for domain, configuration in domain_configurations
-		if configuration.forward_secrecy
-	]
-	ct = [
-		(domain, configuration)
-		for domain, configuration in domain_configurations
-		if configuration.certificate_transparency
-	]
-	tls: Dict[ats.TlsVersion, Set[str]] = dict()
-	for tls_version in ats.TlsVersion:
-		tls[tls_version] = [
-			(domain, configuration)
-			for domain, configuration in domain_configurations
-			if configuration.tls_version is tls_version
-		]
+	for configuration in configurations.values():
+		if configuration.requires_justification:
+			global_requires_justification += 1
+		if not configuration.is_default:
+			global_non_default += 1
+		if configuration.arbitrary_loads:
+			arbitrary += 1
 
 	grp = table.add_group("Configurations", len(configurations), column)
-	table.add_row(grp, "non-default", len(global_non_default), column)
-	table.add_row(grp, "requires justification", len(global_requires_justification), column)
-	table.add_row(grp, "ATS disabled completely", len(no_ats), column)
-	table.add_row(grp, "ATS disabled with exceptions", len(no_ats_with_exceptions), column)
+	table.add_row(grp, "non-default", global_non_default, column)
+	table.add_row(grp, "requires justification", global_requires_justification, column)
+	table.add_row(grp, "arbitrary loads", arbitrary, column)
 
-	grp = table.add_group("Domain configurations", len(domain_configurations), column)
-	table.add_row(grp, "non-default", len(non_default), column)
-	table.add_row(grp, "most-secure", len(most_secure), column)
-	table.add_row(grp, "better than default", len(more_secure), column)
-	table.add_row(grp, "worse than default", len(less_secure), column)
-	table.add_row(grp, "mixed", len(mixed), column)
-	table.add_row(grp, "requires justification", len(requires_justification), column)
-	table.add_row(grp, "HTTP", len(http), column)
+	domain_configurations: Dict[ats.Endpoint, ats.DomainConfiguration] = {
+		endpoint: configuration.exceptions[endpoint.host]
+		for endpoint, configuration in configurations.items()
+	}
+
+	unencrypted = 0
+	encrypted = 0
+
+	default = 0
+	most_secure = 0
+	more_secure = 0
+	less_secure = 0
+	encrypted_less_secure = 0
+	mixed = 0
+	requires_justification = 0
+	encrypted_justify = 0
+	http = 0
+	fs: Set[ats.Endpoint] = set()
+	ct: Set[ats.Endpoint] = set()
+	hsts = 0
+	tls: Dict[ats.TlsVersion, Set[ats.Endpoint]] = defaultdict(set)
+	for endpoint, cfg in domain_configurations.items():
+		if cfg.is_default:
+			default += 1
+		if cfg.requires_justification:
+			requires_justification += 1
+
+		if endpoint.uses_tls:
+			encrypted += 1
+			if cfg < ats.DomainConfiguration():
+				less_secure += 1
+				encrypted_less_secure += 1
+			if cfg.forward_secrecy:
+				fs.add(endpoint)
+			if cfg.certificate_transparency:
+				ct.add(endpoint)
+			tls[cfg.tls_version].add(endpoint)
+			if not (cfg < ats.DomainConfiguration() or ats.DomainConfiguration() < cfg):
+				mixed += 1
+			if cfg.requires_justification:
+				encrypted_justify += 1
+			if cfg == ats.DomainConfiguration.most_secure():
+				most_secure += 1
+			if ats.DomainConfiguration() < cfg:
+				more_secure += 1
+		else:
+			unencrypted += 1
+			if cfg.insecure_http_loads:
+				less_secure += 1
+				http += 1
+			else:
+				hsts += 1
+
+	total = encrypted + unencrypted
+	non_default = total - default
+
+	grp = table.add_group("Domain configurations (all)", total, column)
+	table.add_row(grp, "default", default, column)
+	table.add_row(grp, "non-default", non_default, column)
+	table.add_row(grp, "most-secure", most_secure, column)
+	table.add_row(grp, "better than default", more_secure, column)
+	table.add_row(grp, "worse than default", less_secure, column)
+	table.add_row(grp, "mixed", mixed, column)
+	table.add_row(grp, "requires justification", requires_justification, column)
+
+	grp = table.add_group("Domain configurations (HTTP)", unencrypted, column)
+	table.add_row(grp, "HTTP", http, column)
+	table.add_row(grp, "HSTS", hsts, column)
+
+	grp = table.add_group("Domain configurations (HTTPS)", encrypted, column)
 	table.add_row(grp, "FS", len(fs), column)
 	table.add_row(grp, "CT", len(ct), column)
 	for tls_version in ats.TlsVersion:
 		table.add_row(grp, str(tls_version), len(tls[tls_version]), column)
+	table.add_row(grp, "Most secure", most_secure, column)
+	table.add_row(grp, "Default", default, column)
+	table.add_row(grp, "better than default", more_secure, column)
+	table.add_row(grp, "worse than default", encrypted_less_secure, column)
+	table.add_row(grp, "mixed", mixed, column)
+	table.add_row(grp, "Requires justification", encrypted_justify, column)
 
 
 def failure_statistics(
@@ -603,6 +677,64 @@ def failure_statistics(
 		except ValueError:
 			row = str(code)
 		table.add_row(grp, row, count, column)
+
+
+def plot_ats_history(
+	markers: List[str],
+	data: List[Tuple[str, List[float], List[float], str]],
+	ylabel: str,
+):
+	fig, ax = plt.subplots()
+
+	series: List[str] = []
+	plots: Dict[str, List[plt.Line2D]] = dict()
+
+	for title, perc, error, color in data:
+		plots[title] = plt.plot(markers, perc, color=color, alpha=.75)
+		series.append(title)
+		if error:
+			assert len(error) == len(perc)
+			ax.fill_between(
+				markers,
+				[min(p + e, 100) for p, e in zip(perc, error)],
+				[max(p - e, 0) for p, e in zip(perc, error)],
+				color=color,
+				alpha=.1,
+			)
+
+	# Mark ATS-specific dates
+	plt.axvline(
+		x=month_marker(ats.INTRODUCED_ON),
+		linewidth=1,
+		color=Tomorrow.base0B,
+	)
+	plt.axvline(
+		x=month_marker(ats.JUSTIFICATIONS_REQUIRED_SINCE),
+		linewidth=1,
+		color=Tomorrow.base08,
+	)
+
+	# X axis
+	major_labels = [
+		marker
+		for marker in markers
+		if marker.endswith('-06') or marker.endswith('-12')
+	]
+	plt.xticks(major_labels, rotation=30, ha='right')
+
+	# Y axis
+	ax.yaxis.set_label_position("right")
+	ax.yaxis.tick_right()
+	plt.ylabel(ylabel)
+
+	# Legend
+	plt.legend((plots[t][0] for t in series), series)
+
+	# Layout
+	ax.margins(x=0.01)
+	plt.tight_layout()
+
+	plt.show()
 
 
 class CodesigningIdentityParam(click.ParamType):
@@ -784,6 +916,7 @@ def collect_diagnostics(
 	with tqdm(
 		desc="Analyzing URLs",
 		total=len(pending),
+		unit='URL',
 		leave=True,
 		file=sys.stderr,
 	) as progress:
@@ -904,211 +1037,926 @@ def collect_diagnostics(
 
 
 @cli.command()
+@click.option(
+	'--verbose',
+	is_flag=True,
+	default=False,
+	show_default=True,
+)
+@click.option(
+	'--cache/--no-cache',
+	'use_cached',
+	default=True,
+	show_default=True,
+)
+@click.option(
+	'--mode',
+	type=click.Choice({'configurations', 'support'}),
+	required=True,
+)
 @click.argument(
 	'maap_dir',
 	type=click.Path(dir_okay=True, file_okay=False, readable=True),
 )
-@click.argument(
-	'diagnostics_dir',
-	type=click.Path(dir_okay=True, file_okay=False, readable=True),
-)
-def evaluate_configurations(maap_dir: str, diagnostics_dir: str):
-	e = Evaluation(
-		dataset=maap.Dataset.from_path(Path(maap_dir)),
-		diagnostics=DiagnosticResults.parse(Path(diagnostics_dir)),
-	)
+def evaluate_history(
+	verbose: bool,
+	use_cached: bool,
+	mode: str,
+	maap_dir: str,
+):
+	maap_path = Path(maap_dir)
 
-	# Basic overview of both data sources
-	click.secho(f"Apps: {len(e.dataset.apps)}", fg='blue', bold=True)
-	click.secho(f"Diagnostics from {e.diagnostics.date_range[0]} – {e.diagnostics.date_range[1]}", fg='blue', bold=True)
-	table = Table()
-	endpoint_statistics(e.dataset.endpoints, table, "App")
-	endpoint_statistics(e.diagnostics.endpoints, table, "Diagnostics")
-	#configuration_statistics([app.ats_configuration for app in e.dataset.apps], table, "App")
-	#configuration_statistics(list(e.diagnostics.configurations.values()), table, "Diagnostics")
-	redirection_statistics(e.diagnostics, table, "Diagnostics")
-	table.display()
+	apps: Dict[str, Set[str]] = defaultdict(set)
+	apps_with_network_access: Dict[str, Set[str]] = defaultdict(set)
+	apps_with_ats_support: Dict[str, Set[str]] = defaultdict(set)
+	apps_without_ats_support: Dict[str, Set[str]] = defaultdict(set)
+	apps_with_ats_disabled: Dict[str, Set[str]] = defaultdict(set)
+	apps_with_ats_explicit: Dict[str, Set[str]] = defaultdict(set)
+	apps_with_ats_justify: Dict[str, Set[str]] = defaultdict(set)
+	apps_with_ats_default: Dict[str, Set[str]] = defaultdict(set)
 
-	# Evaluate possible improvements
-	app_can_improve_explicit: Dict[ats.Improvement, Set[App]] = defaultdict(set)
-	app_can_improve_implicit: Dict[ats.Improvement, Set[App]] = defaultdict(set)
+	cache: Dict[str, Tuple[
+		Dict[str, Set[str]],
+		Dict[str, Set[str]],
+		Dict[str, Set[str]],
+		Dict[str, Set[str]],
+		Dict[str, Set[str]],
+		Dict[str, Set[str]],
+		Dict[str, Set[str]],
+		Dict[str, Set[str]],
+	]] = dict()
+	cache_path = Path('evaluate_history.pickle')
+	cache_key = str(maap_path.absolute())
+	use_cached &= cache_path.exists()
+	if use_cached:
+		click.secho(f"Loading cache from '{cache_path}'... ", dim=True, err=True, nl=False)
+		with cache_path.open('rb') as f:
+			cache = pickle.load(f)
 
-	ep_can_improve_explicit: Dict[ats.Improvement, Set[ats.Endpoint]] = defaultdict(set)
-	ep_can_improve_implicit: Dict[ats.Improvement, Set[ats.Endpoint]] = defaultdict(set)
-	d_can_improve_explicit: Dict[ats.Improvement, Set[str]] = defaultdict(set)
-	d_can_improve_implicit: Dict[ats.Improvement, Set[str]] = defaultdict(set)
+		if cache_key in cache:
+			(
+				apps,
+				apps_with_network_access,
+				apps_with_ats_support,
+				apps_without_ats_support,
+				apps_with_ats_disabled,
+				apps_with_ats_explicit,
+				apps_with_ats_justify,
+				apps_with_ats_default,
+			) = cache[cache_key]
+			click.secho("✓", fg='green', dim=True, err=True)
+		else:
+			use_cached = False
+			click.secho("×", fg='red', dim=True, err=True)
 
-	num_implicit_cfgs: int = 0
-	num_explicit_cfgs: int = 0
+	if not use_cached:
+		# Takes about 10 minutes for MAS dataset
 
-	explicit_endpoints: Set[ats.Endpoint] = set()
-	implicit_endpoints: Set[ats.Endpoint] = set()
-	explicit_domains: Set[str] = set()
-	implicit_domains: Set[str] = set()
+		def matches_criteria(app: App) -> bool:
+			return all([
+				app.info_path.exists(),
+				app.binary_path.exists(),
+				app.metadata_path.exists(),
+			])
+		maap_apps = list(maap.walk(maap_path, matches_criteria))
 
-	c_app_explicit: Dict[str, Set[App]] = defaultdict(set)
-	c_app_implicit: Dict[str, Set[App]] = defaultdict(set)
+		# Count
+		for app in tqdm(maap_apps, unit='app', leave=True):
+			# Only analyze apps, where the required information is present
+			assert app.info_path.exists()
+			assert app.binary_path.exists()
+			assert app.metadata_path.exists()
 
-	c_ep_explicit: Dict[str, Set[ats.Endpoint]] = defaultdict(set)
-	c_ep_implicit: Dict[str, Set[ats.Endpoint]] = defaultdict(set)
-	c_d_explicit: Dict[str, Set[str]] = defaultdict(set)
-	c_d_implicit: Dict[str, Set[str]] = defaultdict(set)
+			if verbose:
+				tqdm.write(click.style(f"{app}", dim=True))
 
-	for app, endpoints in e.app_endpoints.items():
-
-		for name, value in [
-			("Arbitrary", app.ats_configuration.arbitrary),
-			("Arbitrary (Media)", app.ats_configuration.arbitrary_media),
-			("Arbitrary (Web)", app.ats_configuration.arbitrary_web),
-		]:
-			if value is None:
-				name = name + " False"
-				c_app_implicit[name].add(app)
-			else:
-				name = name + f" {value}"
-				c_app_explicit[name].add(app)
-
-		if app.ats_configuration.requires_justification:
-			c_app_explicit["Requires justification"].add(app)
-
-		for endpoint in endpoints:
-
-			if not (endpoint.is_relevant and endpoint in e.diagnostics.succeeding.endpoints):
+			initial = app.metadata.release_date
+			if initial is None:
 				continue
+			assert maap.MAS_SUBMISSIONS_SINCE <= initial
+			initial = max(initial, maap.MAS_SINCE)  # Normalize
 
-			domain, configured = app.ats_configuration[endpoint]
-			host, diagnosed = e.diagnostics.succeeding.configurations[endpoint].get(endpoint.host)
+			marker = month_marker(initial)
 
-			if domain is None:
-				num_implicit_cfgs += 1
-				implicit_endpoints.add(endpoint)
-				implicit_domains.add(endpoint.host)
-			else:
-				num_explicit_cfgs += 1
-				explicit_endpoints.add(endpoint)
-				explicit_domains.add(domain)
+			apps[marker].add(app.bundle_id)
 
-			explicit = ats.Improvement(0)
-			implicit = ats.Improvement(0)
-			if diagnosed is not None:
+			current = app.current_version_release_date
+			assert current is not None
+			assert maap.MAS_SUBMISSIONS_SINCE <= initial
+			current = max(current, maap.MAS_SINCE)  # Normalize
 
-				if configured is not None:
-					explicit, implicit = configured.compare_to_diagnosed(diagnosed)
+			marker = month_marker(current)
+
+			if app.can_access_network:
+				apps_with_network_access[marker].add(app.bundle_id)
+
+			configuration = app.ats_configuration
+			if app.supports_ats is not None:
+				if app.supports_ats:
+					apps_with_ats_support[marker].add(app.bundle_id)
+
+					if configuration.is_default:
+						apps_with_ats_default[marker].add(app.bundle_id)
 				else:
-					assert app.ats_configuration.any_arbitrary
-					# No exception for endpoint: anything goes
-					# Hence, the diagnosed configuration is compared to the
-					# least secure configuration. Since the configuration was
-					# not actually read from file, all improvements are implicit.
-					least_secure = ats.ActualDomainConfiguration.least_secure()
-					implicit, _ = least_secure.compare_to_diagnosed(diagnosed)
+					apps_without_ats_support[marker].add(app.bundle_id)
 
-			# Normalize
-			if endpoint.uses_tls:
-				explicit = explicit.https
-				implicit = implicit.https
-			else:
-				explicit = explicit.http
-				implicit = implicit.http
+			if app.ats_dict is not None:
+				apps_with_ats_explicit[marker].add(app.bundle_id)
 
-			if configured:
-				for name_true, name_false, value, default in [
-					("HTTP allowed", "HTTP prohibited", configured.http, False),
-					("FS required", "FS optional", configured.fs, True),
-					("CT required", "CT optional", configured.ct, False),
-				]:
-					if value is not None:
-						name = name_true if value else name_false
-						c_app_explicit[name].add(app)
-						c_ep_explicit[name].add(endpoint)
-						c_d_explicit[name].add(domain if domain else endpoint.host)
-					if value is None:
-						name = name_true if default else name_false
-						c_app_implicit[name].add(app)
-						c_ep_implicit[name].add(endpoint)
-						c_d_implicit[name].add(domain if domain else endpoint.host)
-				if tls := configured.tls:
-					name = f"Min {tls}"
-					c_app_explicit[name].add(app)
-					c_ep_explicit[name].add(endpoint)
-					c_d_explicit[name].add(domain if domain else endpoint.host)
-				if configured.tls is None:
-					name = f"Min {ats.TlsVersion.TLSv1_2}"
-					c_app_implicit[name].add(app)
-					c_ep_implicit[name].add(endpoint)
-					c_d_implicit[name].add(domain if domain else endpoint.host)
-				if configured.requires_justification:
-					name = "Requires justification"
-					c_ep_explicit[name].add(endpoint)
-					c_d_explicit[name].add(domain if domain else endpoint.host)
-			else:
-				assert app.ats_configuration.any_arbitrary
-				name = "Arbitrary w/o exception"
-				c_app_implicit[name].add(app)
-				c_ep_implicit[name].add(endpoint)
-				c_d_implicit[name].add(domain if domain else endpoint.host)
+			if configuration.is_disabled:
+				apps_with_ats_disabled[marker].add(app.bundle_id)
 
-			for improvement in ats.Improvement:
-				if improvement in implicit:
-					app_can_improve_implicit[improvement].add(app)
-					ep_can_improve_implicit[improvement].add(endpoint)
-					d_can_improve_implicit[improvement].add(domain if domain else endpoint.host)
-				if improvement in explicit:
-					app_can_improve_explicit[improvement].add(app)
-					ep_can_improve_explicit[improvement].add(endpoint)
-					d_can_improve_explicit[improvement].add(domain if domain else endpoint.host)
+			if configuration.requires_justification:
+				apps_with_ats_justify[marker].add(app.bundle_id)
 
-	table = Table()
+		cache[cache_key] = (
+			apps,
+			apps_with_network_access,
+			apps_with_ats_support,
+			apps_without_ats_support,
+			apps_with_ats_disabled,
+			apps_with_ats_explicit,
+			apps_with_ats_justify,
+			apps_with_ats_default,
+		)
+		with cache_path.open('wb') as f:
+			pickle.dump(cache, f)
+		click.secho(f"Cached in '{cache_path}'", dim=True, err=True)
 
-	# Applications
-	keys = sorted(set(c_app_explicit.keys()).union(c_app_implicit.keys()))
-	grp = table.add_group("Applications", len(e.dataset.apps), "Explicit")
-	for key in keys:
-		table.add_row(grp, key, len(c_app_explicit[key]), "Explicit")
-	for improvement in ats.Improvement.explicit():
-		table.add_row(grp, str(improvement), len(app_can_improve_explicit[improvement]), "Explicit")
-	grp = table.add_group(grp, len(e.dataset.apps), "Implicit")
-	for key in keys:
-		table.add_row(grp, key, len(c_app_implicit[key]), "Implicit")
-	for improvement in ats.Improvement.implicit():
-		table.add_row(grp, str(improvement), len(app_can_improve_implicit[improvement]), "Implicit")
+	markers: List[str] = [
+		f"{year:4d}-{month:02d}"
+		for year in range(maap.MAS_SINCE.date().year, 2019)
+		for month in range(1, 13)
+	]
+	# MAS accepts submissions since 2010-11
+	#markers = markers[10:]
 
-	# Endpoints
-	keys = sorted(set(c_ep_explicit.keys()).union(c_ep_implicit.keys()))
-	grp = table.add_group("Endpoints", len(explicit_endpoints), "Explicit")
-	for key in keys:
-		table.add_row(grp, key, len(c_ep_explicit[key]), "Explicit")
-	for improvement in ats.Improvement.explicit():
-		table.add_row(grp, str(improvement), len(ep_can_improve_explicit[improvement]), "Explicit")
-	grp = table.add_group(grp, len(implicit_endpoints), "Implicit")
-	for key in keys:
-		table.add_row(grp, key, len(c_ep_implicit[key]), "Implicit")
-	for improvement in ats.Improvement.implicit():
-		table.add_row(grp, str(improvement), len(ep_can_improve_implicit[improvement]), "Implicit")
+	# Dataset only contains apps until Sep. 2018
+	markers = markers[:-3]
 
-	# Domains
-	keys = sorted(set(c_d_explicit.keys()).union(c_d_implicit.keys()))
-	grp = table.add_group("Domains", len(explicit_domains), "Explicit")
-	for key in keys:
-		table.add_row(grp, key, len(c_d_explicit[key]), "Explicit")
-	for improvement in ats.Improvement.explicit():
-		table.add_row(grp, str(improvement), len(d_can_improve_explicit[improvement]), "Explicit")
-	grp = table.add_group(grp, len(implicit_domains), "Implicit")
-	for key in keys:
-		table.add_row(grp, key, len(c_d_implicit[key]), "Implicit")
-	for improvement in ats.Improvement.implicit():
-		table.add_row(grp, str(improvement), len(d_can_improve_implicit[improvement]), "Implicit")
+	# Cumulate
+	apps = cumulate_sets(apps, markers)
+	apps_with_network_access = cumulate_sets(apps_with_network_access, markers)
+	apps_with_ats_support = cumulate_sets(apps_with_ats_support, markers)
+	apps_without_ats_support = cumulate_sets(apps_without_ats_support, markers)
+	apps_with_ats_disabled = cumulate_sets(apps_with_ats_disabled, markers)
+	apps_with_ats_explicit = cumulate_sets(apps_with_ats_explicit, markers)
+	apps_with_ats_justify = cumulate_sets(apps_with_ats_justify, markers)
+	apps_with_ats_default = cumulate_sets(apps_with_ats_default, markers)
 
-	table.display()
-	return
+	# Normalize
+	for marker in markers:
+		if month_marker(ats.INTRODUCED_ON) <= marker:
+			break
+		apps_without_ats_support[marker] = apps[marker]
+
+	def count(source: Dict[str, Set[Any]]) -> List[int]:
+		return [len(source.get(marker, set())) for marker in markers]
+
+	def intersect(lhs: Dict[str, Set[T]], rhs: Dict[str, Set[T]]) -> Dict[str, Set[T]]:
+		return dmap_set(set.intersection, lhs, rhs)
+
+	base = intersect(apps_with_network_access, apps_with_ats_support)
+	num_base = count(base)
+
+	if mode == 'configurations':
+		# Normalize
+		apps_with_ats_disabled = intersect(base, apps_with_ats_disabled)
+		apps_with_ats_explicit = intersect(base, apps_with_ats_explicit)
+		apps_with_ats_justify = intersect(base, apps_with_ats_justify)
+		apps_with_ats_default = intersect(base, apps_with_ats_default)
+
+		num_disabled = count(apps_with_ats_disabled)
+		num_explicit = count(apps_with_ats_explicit)
+		num_justify = count(apps_with_ats_justify)
+		num_default = count(apps_with_ats_default)
+
+		# Write values to terminal
+		for idx, marker in enumerate(markers):
+			if 0 == num_base[idx]:
+				continue
+			table = Table()
+			grp = table.add_group(marker, num_base[idx])
+			table.add_row(grp, "Disabled", num_disabled[idx])
+			table.add_row(grp, "Explicit", num_explicit[idx])
+			table.add_row(grp, "Justify", num_justify[idx])
+			table.add_row(grp, "Default", num_default[idx])
+			table.display()
+
+		# Plot
+		plot_ats_history(
+			markers=markers,
+			data=[(
+				"disabled",
+				percentages(num_disabled, num_base),
+				[],
+				Tomorrow.base09,
+			), (
+				"configured",
+				percentages(num_explicit, num_base),
+				[],
+				Tomorrow.base0E,
+			), (
+				"requires justification",
+				percentages(num_justify, num_base),
+				[],
+				Tomorrow.base0A,
+			), (
+				"default",
+				percentages(num_default, num_base),
+				[],
+				Tomorrow.base0C,
+			)],
+			ylabel=r'\% of free apps with ATS support and network access',
+		)
+
+	elif mode == 'support':
+		noats = intersect(apps_with_network_access, apps_without_ats_support)
+		support_unknown = dmap_set(
+			set.difference,
+			apps,
+			dmap_set(set.union, apps_with_ats_support, apps_without_ats_support)
+		)
+
+		num_apps = count(apps)
+		num_network = count(apps_with_network_access)
+		num_support = count(apps_with_ats_support)
+		num_noats = count(noats)
+		num_nosupport = count(apps_without_ats_support)
+		num_support_unknown = count(support_unknown)
+
+		ats_support_error = percentages(num_support_unknown, num_apps)
+
+		# Write values to terminal
+		for idx, marker in enumerate(markers):
+			if 0 == num_apps[idx]:
+				continue
+			table = Table()
+			grp = table.add_group(marker, num_apps[idx])
+			table.add_row(grp, "Network access", num_network[idx])
+			table.add_row(grp, "ATS support", num_support[idx])
+			table.add_row(grp, "No ATS support", num_nosupport[idx])
+			table.add_row(grp, "ATS support unknown", num_support_unknown[idx])
+			table.add_row(grp, "Network access ∧ ATS support", num_base[idx])
+			table.add_row(grp, "Network access ∧ no ATS support", num_noats[idx])
+			table.display()
+
+		# Plot
+		plot_ats_history(
+			markers=markers,
+			data=[(
+				"network access",
+				percentages(num_network, num_apps),
+				[],
+				Tomorrow.base0E,
+			), (
+				"ATS support",
+				percentages(num_support, num_apps),
+				ats_support_error,
+				Tomorrow.base0D,
+			), (
+				"no ATS support",
+				percentages(num_nosupport, num_apps),
+				ats_support_error,
+				Tomorrow.base0A,
+#			), (
+#				"ATS support unknown",
+#				ats_support_error,
+#				[],
+#				Tomorrow.base08,
+			), (
+				r"network access $\land$ ATS support",
+				percentages(num_base, num_apps),
+				ats_support_error,
+				Tomorrow.base0C,
+			), (
+				r"network access $\land$ no ATS support",
+				percentages(num_noats, num_apps),
+				ats_support_error,
+				Tomorrow.base09,
+			)],
+			ylabel=r'\% of free apps',
+		)
+
+	else:
+		raise NotImplementedError(f"Unhandled mode: {mode}")
 
 
 @cli.command()
+@click.option(
+	'--mas', 'mas_dir',
+	type=click.Path(dir_okay=True, file_okay=False, readable=True),
+	required=True,
+)
+@click.option(
+	'--mu', 'mu_dir',
+	type=click.Path(dir_okay=True, file_okay=False, readable=True),
+	required=True,
+)
 @click.argument(
 	'diagnostics_dir',
 	type=click.Path(dir_okay=True, file_okay=False, readable=True),
 )
-def evaluate_diagnostics(diagnostics_dir: str):
+def compare_configurations(
+	mas_dir: str,
+	mu_dir: str,
+	diagnostics_dir: str,
+):
+	def matches_criteria(app: App) -> bool:
+		return app.info_path.exists()
+
+	mas = maap.Dataset.from_path(Path(mas_dir), matches_criteria, latest=True)
+	mu = maap.Dataset.from_path(Path(mu_dir), matches_criteria, latest=True)
+	diagnostics = DiagnosticResults.parse(Path(diagnostics_dir))
+
+
+	# Basic overview of both data sources
+	click.secho(f"Diagnostics from {diagnostics.date_range[0]} – {diagnostics.date_range[1]}", fg='blue', bold=True)
+	table = Table()
+	endpoint_statistics(mas.endpoints, table, "MAS")
+	endpoint_statistics(mu.endpoints, table, "MU")
+	table.display()
+
+
+def do_evaluate_configurations(
+	maap_path: Path,
+	diagnostics: DiagnosticResults,
+	name: str,
+) -> Tuple[
+	int,
+	int,
+	Dict[str, int],
+	Dict[ats.Improvement, int],
+	Dict[ats.Improvement, int],
+	int,
+	Dict[str, int],
+	Dict[ats.Improvement, int],
+	Dict[ats.Improvement, int],
+]:
+	assert diagnostics == diagnostics.succeeding
+
+	diagnosed_https: Dict[ats.Encrypted, Set[ats.Endpoint]] = defaultdict(set)
+	for endpoint, dcfg in diagnostics.configurations.items():
+		if not endpoint.uses_tls:
+			continue
+		cfg = dcfg.exceptions[endpoint.host]
+		if cfg.forward_secrecy:
+			diagnosed_https[ats.Encrypted.SupportsForwardSecrecy].add(endpoint)
+		if cfg.certificate_transparency:
+			diagnosed_https[ats.Encrypted.SupportsCertificateTransparency].add(endpoint)
+		diagnosed_https[ats.Encrypted.for_tls_version(cfg.tls_version)].add(endpoint)
+
+	def matches_criteria(app: App) -> bool:
+		return app.info_path.exists()
+
+	apps = list(maap.walk(maap_path, matches_criteria))
+
+	per_app: Dict[str, Set[App]] = defaultdict(set)
+	with_cfg: Set[App] = set()
+	improvements_any_per_app: Dict[ats.Improvement, Set[App]] = defaultdict(set)
+	improvements_all_per_app: Dict[ats.Improvement, Set[App]] = defaultdict(set)
+	per_domain: Dict[str, Set[str]] = defaultdict(set)
+	improvements_any_per_domain: Dict[ats.Improvement, Set[str]] = defaultdict(set)
+	improvements_all_per_domain: Dict[ats.Improvement, Set[str]] = defaultdict(set)
+
+	for app in tqdm(apps, unit="app", desc=name, leave=True):
+
+		# Interesting endpoints for an application are all endpoints that were
+		# found within that application, all transitive redirections found
+		# during diagnosing each endpoint and the HTTPS-variants that might
+		# HTTP -> HTTPS upgrades. All endpoints that could not be diagnosed are
+		# ignored.
+		app_endpoints: Set[ats.Endpoint] = set()
+		for endpoint in app.endpoints:
+			app_endpoints.add(endpoint)
+			app_endpoints.add(endpoint.with_tls)
+			current: Optional[ats.Endpoint] = endpoint
+			current_path = [endpoint]
+			while current := diagnostics.redirections.get(current, None):
+				app_endpoints.add(current)
+				app_endpoints.add(current.with_tls)
+				if current in current_path:
+					break  # Avoid redirection loops
+				current_path.append(current)
+		app_endpoints = app_endpoints.intersection(diagnostics.endpoints)
+
+		if app.ats_dict is not None:
+			with_cfg.add(app)
+
+		configuration = app.ats_configuration
+
+		if configuration.arbitrary is not None:
+			per_app[f"arbitrary {configuration.arbitrary}"].add(app)
+
+		if configuration.arbitrary_media is not None:
+			per_app[f"arbitrary media {configuration.arbitrary_media}"].add(app)
+
+		if configuration.arbitrary_web is not None:
+			per_app[f"arbitrary web {configuration.arbitrary_web}"].add(app)
+
+		if configuration.requires_justification:
+			per_app["requires justificiation"].add(app)
+
+		endpoints_for_domain: Dict[str, Set[ats.Endpoint]] = defaultdict(set)
+		for domain, exception in configuration.exceptions.items():
+
+			for key_prefix, value in [
+				("includes subdomains", exception.includes_subdomains),
+				("insecure HTTP", exception.http),
+				("requires FS", exception.fs),
+				("requires CT", exception.ct),
+			]:
+				if value is not None:
+					key = f"{key_prefix} {value}"
+					per_app[key].add(app)
+					per_domain[key].add(domain)
+
+			if exception.tls is not None:
+				key = f"min {exception.tls}"
+				per_app[key].add(app)
+				per_domain[key].add(domain)
+
+			if exception.requires_justification:
+				per_domain["requires justification"].add(domain)
+
+			for endpoint in app_endpoints:
+				host = endpoint.host
+				if domain == host or ats.is_subdomain(host, domain):
+					endpoints_for_domain[domain].add(endpoint)
+
+		endpoint_improvements: Dict[
+			ats.Improvement, Dict[str, Set[ats.Endpoint]]
+		] = defaultdict(lambda: defaultdict(set))
+		for endpoint in app_endpoints:
+			domain, configured = app.ats_configuration[endpoint]
+			h, diagnosed = diagnostics.configurations[endpoint].get(endpoint.host)
+
+			if domain is None:
+				# There is no explicit configuration affecting the endpoint
+				# TODO Handle implicit improvements?
+				continue
+
+			if configured is None:
+				assert app.ats_configuration.any_arbitrary
+				# TODO Handle arbitrary loads?
+				continue
+
+			if diagnosed is None:
+				continue
+
+			explicit, implicit = configured.compare_to_diagnosed(diagnosed)
+			improvements = explicit | implicit
+
+			# Normalize
+			improvements = improvements.https if endpoint.uses_tls else improvements.http
+
+			for improvement in ats.Improvement:
+				if improvement in improvements:
+					endpoint_improvements[improvement][domain].add(endpoint)
+
+			if not endpoint.uses_tls and endpoint.with_tls in diagnostics.endpoints:
+				endpoint_improvements[ats.Improvement.CanDisableHTTP][domain].add(endpoint)
+
+		for improvement in endpoint_improvements.keys():
+			for domain, endpoints in endpoint_improvements[improvement].items():
+
+				if 0 < len(endpoints):
+					improvements_any_per_domain[improvement].add(domain)
+					improvements_any_per_app[improvement].add(app)
+
+				# Only look at all the domains affected by this improvement that
+				# do not already support the paramter that can be improved.
+				domain_endpoints = endpoints_for_domain[domain]
+				if improvement.http != ats.Improvement(0):
+					domain_endpoints = {e for e in domain_endpoints if not e.uses_tls}
+					if improvement is ats.Improvement.CanEnableFS:
+						domain_endpoints -= diagnosed_https[ats.Encrypted.SupportsForwardSecrecy]
+					if improvement is ats.Improvement.CanEnableCT:
+						domain_endpoints -= diagnosed_https[
+							ats.Encrypted.SupportsCertificateTransparency
+						]
+					if improvement is ats.Improvement.CanUpgradeTLS:
+						domain_endpoints -= diagnosed_https[ats.Encrypted.TLSv1_3]
+				if improvement.https != ats.Improvement(0):
+					domain_endpoints = {e for e in domain_endpoints if e.uses_tls}
+				if endpoints == domain_endpoints:
+					improvements_all_per_domain[improvement].add(domain)
+					improvements_all_per_app[improvement].add(app)
+
+	return (
+		len(apps),
+		len(with_cfg),
+		{key: len(values) for key, values in per_app.items()},
+		{key: len(values) for key, values in improvements_any_per_app.items()},
+		{key: len(values) for key, values in improvements_all_per_app.items()},
+		len(set.union(*per_domain.values())),
+		{key: len(values) for key, values in per_domain.items()},
+		{key: len(values) for key, values in improvements_any_per_domain.items()},
+		{key: len(values) for key, values in improvements_all_per_domain.items()},
+	)
+
+
+@cli.command()
+@click.option(
+	'--per',
+	type=click.Choice(['app', 'app-with-cfg', 'domain']),
+	required=True,
+)
+@click.option(
+	'--mas', 'mas_dir',
+	type=click.Path(dir_okay=True, file_okay=False, readable=True),
+	required=True,
+)
+@click.option(
+	'--mu', 'mu_dir',
+	type=click.Path(dir_okay=True, file_okay=False, readable=True),
+	required=True,
+)
+@click.argument(
+	'diagnostics_dir',
+	type=click.Path(dir_okay=True, file_okay=False, readable=True),
+)
+def evaluate_configurations(
+	per: str,
+	mas_dir: str,
+	mu_dir: str,
+	diagnostics_dir: str,
+):
+	# TODO `--per app` or `--per app-with-cfg` do not make much sense, yet.
+	# TODO Add `--per endpoint`?
+
+	mas_path = Path(mas_dir)
+	mu_path = Path(mu_dir)
+	diagnostics_path = Path(diagnostics_dir)
+
+	mas = 'MAS'
+	mu = 'MU'
+
+	apps: Dict[str, int] = dict()
+	with_cfg: Dict[str, int] = dict()
+	per_app: Dict[str, Dict[str, int]] = dict()
+	improvements_any_per_app: Dict[str, Dict[ats.Improvement, int]] = dict()
+	improvements_all_per_app: Dict[str, Dict[ats.Improvement, int]] = dict()
+
+	domains: Dict[str, int] = dict()
+	per_domain: Dict[str, Dict[str, int]] = dict()
+	improvements_any_per_domain: Dict[str, Dict[ats.Improvement, int]] = dict()
+	improvements_all_per_domain: Dict[str, Dict[ats.Improvement, int]] = dict()
+
+	diagnostics: Optional[DiagnosticResults] = None
+
+	cache: Dict[str, Tuple[
+		int,
+		int,
+		Dict[str, int],
+		Dict[ats.Improvement, int],
+		Dict[ats.Improvement, int],
+		int,
+		Dict[str, int],
+		Dict[ats.Improvement, int],
+		Dict[ats.Improvement, int],
+	]] = dict()
+	cache_path = Path('evaluate_configurations.pickle')
+	click.secho(f"Loading cache from '{cache_path}'... ", dim=True, err=True, nl=False)
+	if cache_path.exists():
+		with cache_path.open('rb') as f:
+			cache = pickle.load(f)
+		click.secho("✓", fg='green', dim=True, err=True)
+	else:
+		click.secho("×", fg='red', dim=True, err=True)
+
+	for maap_path, name in [(mas_path, mas), (mu_path, mu)]:
+		cache_key = str(maap_path.absolute())
+		click.secho(f"Looking up {name} in cache... ", dim=True, err=True, nl=False)
+		if cache_key in cache:
+			(
+				apps[name],
+				with_cfg[name],
+				per_app[name],
+				improvements_any_per_app[name],
+				improvements_all_per_app[name],
+				domains[name],
+				per_domain[name],
+				improvements_any_per_domain[name],
+				improvements_all_per_domain[name],
+			) = cache[cache_key]
+			click.secho("✓", fg='green', dim=True, err=True)
+		else:
+			click.secho("×", fg='red', dim=True, err=True)
+			if diagnostics is None:
+				diagnostics = DiagnosticResults.parse(diagnostics_path).succeeding
+			assert diagnostics is not None
+			(
+				apps[name],
+				with_cfg[name],
+				per_app[name],
+				improvements_any_per_app[name],
+				improvements_all_per_app[name],
+				domains[name],
+				per_domain[name],
+				improvements_any_per_domain[name],
+				improvements_all_per_domain[name],
+			) = do_evaluate_configurations(maap_path, diagnostics, name)
+			cache[cache_key] = (
+				apps[name],
+				with_cfg[name],
+				per_app[name],
+				improvements_any_per_app[name],
+				improvements_all_per_app[name],
+				domains[name],
+				per_domain[name],
+				improvements_any_per_domain[name],
+				improvements_all_per_domain[name],
+			)
+			with cache_path.open('wb') as f:
+				pickle.dump(cache, f)
+			click.secho(f"Cached in '{cache_path}'", dim=True, err=True)
+
+	table = Table()
+
+	keys = sorted(set.union(set(per_app[mas].keys()), set(per_app[mu].keys())))
+	for dataset in [mas, mu]:
+		for grp, base in [
+			("Applications", apps[dataset]),
+			("Applications with configuration", with_cfg[dataset]),
+		]:
+			table.add_group(grp, base, dataset)
+			for key in keys:
+				table.add_row(grp, key, per_app[dataset].get(key, 0), dataset)
+			if grp == "Applications":
+				table.add_row(grp, "with configuration", with_cfg[dataset], dataset)
+			for improvement in ats.Improvement:
+				table.add_row(
+					grp,
+					f"{improvement} (any for any domain)",
+					improvements_any_per_app[dataset].get(improvement, 0),
+					dataset,
+				)
+				table.add_row(
+					grp,
+					f"{improvement} (all for any domain)",
+					improvements_all_per_app[dataset].get(improvement, 0),
+					dataset,
+				)
+
+	keys = sorted(set.union(set(per_domain[mas].keys()), set(per_domain[mu].keys())))
+	for dataset in [mas, mu]:
+		grp = table.add_group("Configured exception domains", domains[dataset], dataset)
+		for key in keys:
+			table.add_row(grp, key, per_domain[dataset].get(key, 0), dataset)
+		for improvement in ats.Improvement:
+			table.add_row(
+				grp,
+				f"{improvement} (any in any app)",
+				improvements_any_per_domain[dataset].get(improvement, 0),
+				dataset,
+			)
+			table.add_row(
+				grp,
+				f"{improvement} (all in any app)",
+				improvements_all_per_domain[dataset].get(improvement, 0),
+				dataset,
+			)
+
+	table.display()
+
+	# Plot
+	is_per_app: bool = False
+	totals: Dict[str, int]
+	values: Dict[str, Dict[str, int]]
+	improvements_any: Dict[str, Dict[ats.Improvement, int]]
+	improvements_all: Dict[str, Dict[ats.Improvement, int]]
+	ylabel: str
+	if per == 'app':
+		is_per_app = True
+		totals = apps
+		ylabel = r"\% of apps"
+	elif per == 'app-with-cfg':
+		is_per_app = True
+		totals = with_cfg
+		ylabel = r"\% of apps with explicit ATS configuration"
+	elif per == 'domain':
+		totals = domains
+		values = per_domain
+		improvements_any = improvements_any_per_domain
+		improvements_all = improvements_all_per_domain
+		ylabel = r"\% of configured exception domains"
+	else:
+		raise NotImplementedError(f"Unhandled value for '--per': {per}")
+
+	if is_per_app:
+		values = per_app
+		improvements_any = improvements_any_per_app
+		improvements_all = improvements_all_per_app
+
+	fig, ax = plt.subplots()
+
+	width = .4
+	hatch_density = 5
+
+	labels = []
+	if is_per_app:
+		labels += [
+			"arbitrary", "arbitrary media", "arbitrary web",
+			None,
+		]
+	labels += [
+		"TLS optional", r"\textbf{TLS required}", r"\textit{could require}",
+		None,
+		"FS optional", r"\textbf{FS required}", r"\textit{could require}",
+		None,
+		r"\textbf{CT optional}", "CT required", r"\textit{could require}",
+		None,
+		r"min.\ TLSv1.0", r"min.\ TLSv1.1", r"\textbf{min.\ TLSv1.2}",
+		r"min.\ TLSv1.3", r"\textit{could increase}",
+		None,
+		"justification", r"\textit{could avoid}",
+	]
+	explicit: Dict[str, List[int]] = defaultdict(list)
+	implicit: Dict[str, List[int]] = defaultdict(list)
+	improve_any: Dict[str, List[int]] = defaultdict(list)
+	improve_all: Dict[str, List[int]] = defaultdict(list)
+
+	cmas = Tomorrow.base0D
+	cmu = Tomorrow.base0A
+
+	for dataset in [mas, mu]:
+		if is_per_app:
+			for key in ['', ' media', ' web']:
+				key = f'arbitrary{key}'
+				explicit_true = values[dataset].get(f"{key} True", 0)
+				explicit_false = values[dataset].get(f"{key} False", 0)
+				explicit[dataset].append(explicit_true)
+				implicit[dataset].append(0)
+				improve_all[dataset].append(0)
+				improve_any[dataset].append(0)
+			explicit[dataset].append(0)
+			implicit[dataset].append(0)
+			improve_all[dataset].append(0)
+			improve_any[dataset].append(0)
+
+		for key, default, flip, improvement in [
+			('insecure HTTP', False, True, ats.Improvement.CanDisableHTTP),
+			('requires FS', True, False, ats.Improvement.CanEnableFS),
+			('requires CT', False, False, ats.Improvement.CanEnableCT),
+		]:
+			explicit_true = values[dataset].get(f"{key} True", 0)
+			explicit_false = values[dataset].get(f"{key} False", 0)
+			implicit_num = totals[dataset] - explicit_true - explicit_false
+
+			explicit[dataset].append(explicit_true if flip else explicit_false)
+			explicit[dataset].append(explicit_false if flip else explicit_true)
+			explicit[dataset].append(0)
+
+			implicit[dataset].append(implicit_num if not (default or flip) else 0)
+			implicit[dataset].append(implicit_num if default or flip else 0)
+			implicit[dataset].append(0)
+
+			i_all = improvements_all[dataset].get(improvement, 0)
+			i_any = improvements_any[dataset].get(improvement, 0)
+
+			improve_all[dataset].append(0)
+			improve_all[dataset].append(0)
+			improve_all[dataset].append(i_all)
+			improve_any[dataset].append(0)
+			improve_any[dataset].append(0)
+			improve_any[dataset].append(i_any - i_all)
+
+			explicit[dataset].append(0)
+			implicit[dataset].append(0)
+			improve_all[dataset].append(0)
+			improve_any[dataset].append(0)
+
+		for tls in ats.TlsVersion:
+			explicit_num = values[dataset].get(f"min {tls}", 0)
+			explicit[dataset].append(explicit_num)
+			implicit[dataset].append(
+				totals[dataset] - explicit_num if tls is ats.TlsVersion.TLSv1_2 else 0
+			)
+			improve_all[dataset].append(0)
+			improve_any[dataset].append(0)
+		explicit[dataset].append(0)
+		implicit[dataset].append(0)
+		i_all = improvements_all[dataset].get(ats.Improvement.CanUpgradeTLS, 0)
+		i_any = improvements_any[dataset].get(ats.Improvement.CanUpgradeTLS, 0)
+		improve_all[dataset].append(i_all)
+		improve_any[dataset].append(i_any - i_all)
+
+		explicit[dataset].append(0)
+		implicit[dataset].append(0)
+		improve_all[dataset].append(0)
+		improve_any[dataset].append(0)
+
+		num = values[dataset].get("requires justification", 0)
+		explicit[dataset].append(num)
+		implicit[dataset].append(0)
+		improve_all[dataset].append(0)
+		improve_any[dataset].append(0)
+		improvement = ats.Improvement.RemovesJustification
+		i_all = improvements_all[dataset].get(improvement, 0)
+		i_any = improvements_any[dataset].get(improvement, 0)
+		explicit[dataset].append(0)
+		implicit[dataset].append(0)
+		improve_all[dataset].append(i_all)
+		improve_any[dataset].append(i_any - i_all)
+
+		assert len(labels) == len(explicit[dataset]), f"{dataset}: {len(labels)} ≠ {len(explicit[dataset])}"
+		assert len(labels) == len(implicit[dataset]), f"{dataset}: {len(labels)} ≠ {len(implicit[dataset])}"
+		assert len(labels) == len(improve_all[dataset]), f"{dataset}: {len(labels)} ≠ {len(improve_all[dataset])}"
+		assert len(labels) == len(improve_any[dataset]), f"{dataset}: {len(labels)} ≠ {len(improve_any[dataset])}"
+
+	xs = list(range(len(labels)))
+	xticks = [x for x, label in enumerate(labels) if label is not None]
+
+	for dataset, color, side in [(mas, cmas, -1), (mu, cmu, 1)]:
+		pos = [x + side / 30 + side * width / 2 for x in xs]
+
+		ts = [totals[dataset]] * len(labels)
+
+		ax.bar(
+			pos,
+			percentages(explicit[dataset], ts),
+			width,
+			color=color,
+			alpha=.75,
+			edgecolor=color,
+		)
+		ax.bar(
+			pos,
+			percentages(implicit[dataset], ts),
+			width,
+			bottom=percentages(explicit[dataset], ts),
+			color=color,
+			alpha=.25,
+			edgecolor=color,
+		)
+
+		# If filled, PDF export of hatches will fail,
+		# see https://stackoverflow.com/q/5195466/5082444
+		ax.bar(
+			pos,
+			percentages(improve_all[dataset], ts),
+			width,
+			fill=False,
+			alpha=.75,
+			edgecolor=color,
+			hatch='/' * hatch_density,
+		)
+		ax.bar(
+			pos,
+			percentages(improve_any[dataset], ts),
+			width,
+			bottom=percentages(improve_all[dataset], ts),
+			fill=False,
+			alpha=.25,
+			edgecolor=color,
+			hatch='/' * hatch_density,
+		)
+
+	ax.set_ylabel(ylabel)
+	ax.set_xticks(xticks)
+	ax.set_xticklabels(
+		[label for label in labels if label is not None],
+		rotation=45,
+		ha='right',
+	)
+	plt.axhline(y=0, linewidth=.5, color='black')
+
+	# Add legend
+	c = Tomorrow.base05
+	plt.legend(
+		handles=[
+			Patch(color=cmas, alpha=.75, label="MAS"),
+			Patch(color=cmu, alpha=.75, label="MU"),
+			Patch(color=c, alpha=.25, label="implicit"),
+			Patch(color=c, alpha=.75, label="explicit"),
+			Patch(edgecolor=c, fill=False, alpha=.25, hatch='/' * hatch_density, label="improvement (any)"),
+			Patch(edgecolor=c, fill=False, alpha=.75, hatch='/' * hatch_density, label="improvement (all)"),
+		],
+		ncol=3,
+	)
+
+	# Layout
+	ax.margins(x=0.01)
+	plt.tight_layout()
+
+	plt.show()
+
+
+@cli.command()
+@click.option(
+	'--redirects/--no-redirects', 'show_redirects',
+	default=True,
+	show_default=True,
+)
+@click.argument(
+	'diagnostics_dir',
+	type=click.Path(dir_okay=True, file_okay=False, readable=True),
+)
+def evaluate_diagnostics(
+	show_redirects: bool,
+	diagnostics_dir: str,
+):
 	diagnostics_path = Path(diagnostics_dir)
 
 	diagnostics = DiagnosticResults.parse(diagnostics_path)
@@ -1123,26 +1971,59 @@ def evaluate_diagnostics(diagnostics_dir: str):
 	)
 
 	table = Table()
-
-	endpoint_statistics(succeeding.endpoints, table, "Succeeding")
-	redirection_statistics(succeeding, table, "Succeeding")
-	configuration_statistics(
-		list(succeeding.configurations.values()),
-		table,
-		"Succeeding",
-	)
-
-	endpoint_statistics(failing.endpoints, table, "Failing")
-	redirection_statistics(failing, table, "Failing")
-	configuration_statistics(
-		list(failing.configurations.values()),
-		table,
-		"Failing",
-	)
-
-	failure_statistics(failing, table, "Failing")
-
+	endpoint_statistics(succeeding.endpoints, table)
 	table.display()
+
+	table = Table()
+	failure_statistics(failing, table)
+	table.display()
+
+	if show_redirects:
+		table = Table()
+		redirection_statistics(succeeding, table)
+		table.display()
+
+	table = Table()
+	configuration_statistics(succeeding.configurations, table)
+	table.display()
+
+
+@cli.command()
+@click.option(
+	'--format',
+	'output_format',
+	type=click.Choice(['text', 'json']),
+	required=True,
+	default='text',
+)
+@click.option(
+	'--reverse-domain-name/--no-reverse-domain-name',
+	default=False,
+)
+@click.argument(
+	'diagnostics_dir',
+	type=click.Path(dir_okay=True, file_okay=False, readable=True),
+)
+def hsts_preload_list(
+	output_format: str,
+	reverse_domain_name: bool,
+	diagnostics_dir: str,
+):
+	diagnostics_path = Path(diagnostics_dir)
+	diagnostics = DiagnosticResults.parse(diagnostics_path)
+
+	hsts: List[str] = [
+		endpoint.reverse_domain_name if reverse_domain_name else endpoint.host
+		for endpoint in diagnostics.hsts_preload
+	]
+
+	if output_format == 'text':
+		for host in hsts:
+			click.echo(host)
+	elif output_format == 'json':
+		click.echo(json.dumps(hsts))
+	else:
+		raise NotImplementedError(f"Unsupported output format: {output_format}")
 
 
 @cli.command()

@@ -22,6 +22,10 @@ from click import style, unstyle
 from utilities import CodesigningIdentity, State, Utility
 
 
+INTRODUCED_ON = datetime.fromisoformat('2015-09-01T00:00:00+00:00')
+JUSTIFICATIONS_REQUIRED_SINCE = datetime.fromisoformat('2017-01-01T00:00:00+00:00')
+
+
 class LogFunc(Protocol):
 
 	def __call__(self, msg: str, nl: bool = True): ...
@@ -153,12 +157,18 @@ class Error(enum.IntEnum):
 	- Trying to connect without TLS to a TLS server
 	"""
 
+	NotConnectedToInternet = -1009
+
 	ATSError = -1022
 	"""
 	- Occurs for HTTP, even if the URL would redirect to HTTPS
 	"""
 
 	SSLError = -1200
+
+	ServerCertificateUntrusted = -1202
+
+	ClientCertificateRejected = -1205
 
 	@property
 	def display(self) -> str:
@@ -173,6 +183,8 @@ class SSLError(enum.IntEnum):
 	Defined in Security/SecBase.h:
 	https://opensource.apple.com/source/Security/Security-59306.140.5/base/SecBase.h.auto.html
 	"""
+
+	Protocol = -9800
 
 	FatalAlert = -9802
 	"""
@@ -446,6 +458,44 @@ class Endpoint:
 			if endpoint := emit_candidate(value, scheme_end, log_error):
 				yield endpoint
 			break
+
+
+class Encrypted(enum.Flag):
+	SupportsForwardSecrecy = enum.auto()
+	SupportsCertificateTransparency = enum.auto()
+	TLSv1_0 = enum.auto()
+	TLSv1_1 = enum.auto()
+	TLSv1_2 = enum.auto()
+	TLSv1_3 = enum.auto()
+
+	@property
+	def tls_version(self) -> TlsVersion:
+		cls = self.__class__
+		tls_mask = cls.TLSv1_0 | cls.TLSv1_1 | cls.TLSv1_2 | cls.TLSv1_3
+		flag = self & tls_mask
+		if flag is cls.TLSv1_0:
+			return TlsVersion.TLSv1_0
+		elif flag is cls.TLSv1_1:
+			return TlsVersion.TLSv1_1
+		elif flag is cls.TLSv1_2:
+			return TlsVersion.TLSv1_2
+		elif flag is cls.TLSv1_3:
+			return TlsVersion.TLSv1_3
+		else:
+			assert False, "Multiple TLS flags set."
+
+	@classmethod
+	def for_tls_version(cls, tls_version: TlsVersion) -> 'Encrypted':
+		return {
+			TlsVersion.TLSv1_0: cls.TLSv1_0,
+			TlsVersion.TLSv1_1: cls.TLSv1_1,
+			TlsVersion.TLSv1_2: cls.TLSv1_2,
+			TlsVersion.TLSv1_3: cls.TLSv1_3,
+		}[tls_version]
+
+
+class Unencrypted(enum.Flag):
+	InsecureHTTPLoads = enum.auto()
 
 
 class Improvement(enum.Flag):
@@ -811,6 +861,15 @@ class ActualDomainConfiguration:
 	ct: Optional[bool] = None
 	tls: Optional[TlsVersion] = None
 
+	@property
+	def is_default(self) -> bool:
+		return all([
+			self.http is None or not self.http,
+			self.fs is None or self.fs,
+			self.ct is None or not self.ct,
+			self.tls is None or self.tls is TlsVersion.TLSv1_2,
+		])
+
 	def compare_to_diagnosed(
 		self,
 		other: DomainConfiguration,
@@ -916,6 +975,16 @@ class ActualConfiguration:
 			self.arbitrary_media is not None and self.arbitrary_media,
 			self.arbitrary_web is not None and self.arbitrary_web,
 		])
+
+	@property
+	def is_disabled(self) -> bool:
+		return self.any_arbitrary and not self.exceptions
+
+	@property
+	def is_default(self) -> bool:
+		return not self.any_arbitrary and all(
+			exception.is_default for exception in self.exceptions.values()
+		)
 
 	@property
 	def requires_justification(self) -> bool:
