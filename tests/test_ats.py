@@ -11,6 +11,8 @@ from random import randint
 
 import ddt
 
+import tls
+
 from ats import (
 	Configuration,
 	DiagnoseUtility,
@@ -19,7 +21,6 @@ from ats import (
 	Endpoint,
 	Error,
 	SSLError,
-	TlsVersion,
 	find_best_configuration,
 )
 
@@ -193,7 +194,7 @@ class TestDiagnosticsLive(unittest.TestCase):
 
 	def start_server(
 		self,
-		maximum_tls_version: Optional[TlsVersion] = None,
+		maximum_tls_version: Optional[tls.Version] = None,
 		opts: Optional[List[str]] = None,
 	):
 		assert self.server is None
@@ -203,7 +204,7 @@ class TestDiagnosticsLive(unittest.TestCase):
 
 		if maximum_tls_version is not None:
 			max_protocol = str(maximum_tls_version)
-			if maximum_tls_version is TlsVersion.TLSv1_0:
+			if maximum_tls_version is tls.v1_0:
 				max_protocol = max_protocol[:-2]
 			opts += ['-max_protocol', max_protocol]
 
@@ -252,21 +253,21 @@ class TestDiagnosticsLive(unittest.TestCase):
 
 	@requires_test_environment
 	@ddt.data(
-		(DomainConfiguration(), TlsVersion.TLSv1_2, []),
-		(DomainConfiguration(), TlsVersion.TLSv1_3, []),
+		(DomainConfiguration(), tls.v1_2, []),
+		(DomainConfiguration(), tls.v1_3, []),
 		(
-			DomainConfiguration(tls_version=TlsVersion.TLSv1_3),
-			TlsVersion.TLSv1_3,
+			DomainConfiguration(tls_version=tls.v1_3),
+			tls.v1_3,
 			[],
 		),
 		(
 			DomainConfiguration(forward_secrecy=False),
-			TlsVersion.TLSv1_2,
+			tls.v1_2,
 			[],
 		),
 		(
 			DomainConfiguration(forward_secrecy=False),
-			TlsVersion.TLSv1_2,
+			tls.v1_2,
 			['-no_dhe', '-cipher', 'AES256-GCM-SHA384'],  # disable FS
 		),
 	)
@@ -274,7 +275,7 @@ class TestDiagnosticsLive(unittest.TestCase):
 	def test_atsprobe_positive(
 		self,
 		domain_configuration: DomainConfiguration,
-		maximum_tls_version: TlsVersion,
+		maximum_tls_version: tls.Version,
 		server_opts: List[str],
 	):
 		configuration = Configuration(
@@ -300,23 +301,23 @@ class TestDiagnosticsLive(unittest.TestCase):
 
 	@requires_test_environment
 	@ddt.data(
-		(DomainConfiguration(), TlsVersion.TLSv1_0, SSLError.PeerProtocolVersion, []),
-		(DomainConfiguration(), TlsVersion.TLSv1_1, SSLError.PeerProtocolVersion, []),
+		(DomainConfiguration(), tls.v1_0, SSLError.PeerProtocolVersion, []),
+		(DomainConfiguration(), tls.v1_1, SSLError.PeerProtocolVersion, []),
 		(  # Test certificate is not in CT log
 			DomainConfiguration.most_secure(),
-			TlsVersion.TLSv1_3,
+			tls.v1_3,
 			SSLError.FatalAlert,
 			[],
 		),
 		(
-			DomainConfiguration(tls_version=TlsVersion.TLSv1_3),
-			TlsVersion.TLSv1_2,
+			DomainConfiguration(tls_version=tls.v1_3),
+			tls.v1_2,
 			SSLError.PeerProtocolVersion,
 			[],
 		),
 		(
 			DomainConfiguration(),
-			TlsVersion.TLSv1_2,  # PFS is enforced in TLSv1.3
+			tls.v1_2,  # PFS is enforced in TLSv1.3
 			SSLError.PeerHandshakeFail,
 			['-no_dhe', '-cipher', 'AES256-GCM-SHA384'],  # disable FS
 		),
@@ -325,7 +326,7 @@ class TestDiagnosticsLive(unittest.TestCase):
 	def test_atsprobe_negative(
 		self,
 		domain_configuration: DomainConfiguration,
-		maximum_tls_version: TlsVersion,
+		maximum_tls_version: tls.Version,
 		error_code: SSLError,
 		server_opts: List[str],
 	):
@@ -367,7 +368,7 @@ class TestDiagnosticsLive(unittest.TestCase):
 	@requires_test_environment
 	@ddt.data(
 		(
-			TlsVersion.TLSv1_3,
+			tls.v1_3,
 			[],
 			{'NSExceptionDomains': {'localhost': {
 				'NSExceptionMinimumTLSVersion': 'TLSv1.3',
@@ -377,7 +378,7 @@ class TestDiagnosticsLive(unittest.TestCase):
 	@ddt.unpack
 	def test_find_best_configuration(
 		self,
-		maximum_tls_version: TlsVersion,
+		maximum_tls_version: tls.Version,
 		server_opts: List[str],
 		expected: Optional[Dict[str, Any]],
 	):

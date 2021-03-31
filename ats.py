@@ -19,6 +19,7 @@ import OpenSSL
 
 from click import style, unstyle
 
+import tls
 from utilities import CodesigningIdentity, State, Utility
 
 
@@ -259,25 +260,6 @@ class Action(enum.Flag):
 	Investigate = enum.auto()
 
 
-@enum.unique
-class TlsVersion(enum.IntEnum):
-	TLSv1_0 = 0
-	TLSv1_1 = 1
-	TLSv1_2 = 2
-	TLSv1_3 = 3
-
-	def __str__(self) -> str:
-		return f"TLSv1.{self.value}"
-
-	@classmethod
-	def from_str(cls, value: str) -> 'TlsVersion':
-		rx = re.compile(r'^TLSv1\.([0-3])$')
-		m = rx.fullmatch(value)
-		if not m:
-			raise ValueError(f"Invalid TlsVersion: {value}")
-		return cls(int(m.group(1)))
-
-
 @dataclass(frozen=True)
 class Certificate:
 	crt: OpenSSL.crypto.X509
@@ -469,28 +451,28 @@ class Encrypted(enum.Flag):
 	TLSv1_3 = enum.auto()
 
 	@property
-	def tls_version(self) -> TlsVersion:
+	def tls_version(self) -> tls.Version:
 		cls = self.__class__
 		tls_mask = cls.TLSv1_0 | cls.TLSv1_1 | cls.TLSv1_2 | cls.TLSv1_3
 		flag = self & tls_mask
 		if flag is cls.TLSv1_0:
-			return TlsVersion.TLSv1_0
+			return tls.v1_0
 		elif flag is cls.TLSv1_1:
-			return TlsVersion.TLSv1_1
+			return tls.v1_1
 		elif flag is cls.TLSv1_2:
-			return TlsVersion.TLSv1_2
+			return tls.v1_2
 		elif flag is cls.TLSv1_3:
-			return TlsVersion.TLSv1_3
+			return tls.v1_3
 		else:
 			assert False, "Multiple TLS flags set."
 
 	@classmethod
-	def for_tls_version(cls, tls_version: TlsVersion) -> 'Encrypted':
+	def for_tls_version(cls, tls_version: tls.Version) -> 'Encrypted':
 		return {
-			TlsVersion.TLSv1_0: cls.TLSv1_0,
-			TlsVersion.TLSv1_1: cls.TLSv1_1,
-			TlsVersion.TLSv1_2: cls.TLSv1_2,
-			TlsVersion.TLSv1_3: cls.TLSv1_3,
+			tls.v1_0: cls.TLSv1_0,
+			tls.v1_1: cls.TLSv1_1,
+			tls.v1_2: cls.TLSv1_2,
+			tls.v1_3: cls.TLSv1_3,
 		}[tls_version]
 
 
@@ -536,14 +518,14 @@ class Improvement(enum.Flag):
 class DomainConfiguration:
 	includes_subdomains: bool = False
 	insecure_http_loads: bool = False
-	tls_version: TlsVersion = TlsVersion.TLSv1_2
+	tls_version: tls.Version = tls.v1_2
 	forward_secrecy: bool = True
 	certificate_transparency: bool = False
 
 	@classmethod
 	def most_secure(cls) -> 'DomainConfiguration':
 		return cls(
-			tls_version=TlsVersion.TLSv1_3,
+			tls_version=tls.v1_3,
 			certificate_transparency=True,
 		)
 
@@ -566,11 +548,11 @@ class DomainConfiguration:
 		The information was obtained from official documentation and might not
 		reflect actual App Review decisions and is subject to change.
 		"""
-		return self.insecure_http_loads or self.tls_version < TlsVersion.TLSv1_2
+		return self.insecure_http_loads or self.tls_version < tls.v1_2
 
 	@property
 	def can_decrease_tls_version(self) -> bool:
-		return TlsVersion.TLSv1_0 < self.tls_version
+		return tls.v1_0 < self.tls_version
 
 	def _values_lt(self, other: 'DomainConfiguration') -> Tuple[bool, bool, bool, bool]:
 		return (
@@ -630,7 +612,7 @@ class DomainConfiguration:
 
 		flags.append(style(
 			str(self.tls_version),
-			fg='red' if self.tls_version < TlsVersion.TLSv1_2 else 'green',
+			fg='red' if self.tls_version < tls.v1_2 else 'green',
 			bold=self.tls_version != default.tls_version,
 		))
 
@@ -702,7 +684,7 @@ class DomainConfiguration:
 			'NSExceptionMinimumTLSVersion',
 			str(default.tls_version),
 		)
-		tls_version = TlsVersion.from_str(tls_version_str)
+		tls_version = tls.Version.from_str(tls_version_str)
 		if tls_version is None:
 			raise ValueError(
 				f"Invalid value for 'NSExceptionMinimumTLSVersion': {tls_version_str}"
@@ -859,7 +841,7 @@ class ActualDomainConfiguration:
 	http: Optional[bool] = None
 	fs: Optional[bool] = None
 	ct: Optional[bool] = None
-	tls: Optional[TlsVersion] = None
+	tls: Optional[tls.Version] = None
 
 	@property
 	def is_default(self) -> bool:
@@ -867,7 +849,7 @@ class ActualDomainConfiguration:
 			self.http is None or not self.http,
 			self.fs is None or self.fs,
 			self.ct is None or not self.ct,
-			self.tls is None or self.tls is TlsVersion.TLSv1_2,
+			self.tls is None or self.tls is tls.v1_2,
 		])
 
 	def compare_to_diagnosed(
@@ -889,7 +871,7 @@ class ActualDomainConfiguration:
 		if other.certificate_transparency and self.ct is not None and not self.ct:
 			explicit |= Improvement.CanEnableCT
 
-		if self.tls is None and TlsVersion.TLSv1_2 < other.tls_version:
+		if self.tls is None and tls.v1_2 < other.tls_version:
 			implicit |= Improvement.CanUpgradeTLS
 
 		if self.tls is not None and self.tls < other.tls_version:
@@ -906,7 +888,7 @@ class ActualDomainConfiguration:
 	def requires_justification(self) -> bool:
 		return any([
 			self.http is not None and self.http,
-			self.tls is not None and self.tls < TlsVersion.TLSv1_2,
+			self.tls is not None and self.tls < tls.v1_2,
 		])
 
 	@classmethod
@@ -916,7 +898,7 @@ class ActualDomainConfiguration:
 			http=True,
 			fs=False,
 			ct=False,
-			tls=TlsVersion.TLSv1_0,
+			tls=tls.v1_0,
 		)
 
 	@classmethod
@@ -942,12 +924,12 @@ class ActualDomainConfiguration:
 			if type(value) is bool:
 				ct = value
 
-		tls: Optional[TlsVersion] = None
+		tls: Optional[tls.Version] = None
 		for key, is_deprecated in key_variants('NSExceptionMinimumTLSVersion'):
 			if raw := ats_dict.get(key, None):
 				if type(raw) is str:
 					try:
-						tls = TlsVersion.from_str(raw)
+						tls = tls.Version.from_str(raw)
 						break
 					except ValueError:
 						pass
@@ -1471,7 +1453,7 @@ def find_best_configuration(
 
 			if Action.DecreaseTlsVersion in actions:
 				assert domain_configuration.can_decrease_tls_version
-				tls_version = TlsVersion(tls_version - 1)
+				tls_version = tls.Version(tls_version - 1)
 				log_special("  → ", nl=False)
 				log_info(f"Decreasing required TLS version to {tls_version}")
 

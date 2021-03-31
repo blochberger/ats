@@ -23,6 +23,7 @@ from tqdm._utils import _term_move_up as term_move_up
 import ats
 import exodus
 import maap
+import tls
 
 from maap import App
 from utilities import (
@@ -586,7 +587,7 @@ def configuration_statistics(
 	fs: Set[ats.Endpoint] = set()
 	ct: Set[ats.Endpoint] = set()
 	hsts = 0
-	tls: Dict[ats.TlsVersion, Set[ats.Endpoint]] = defaultdict(set)
+	tls: Dict[tls.Version, Set[ats.Endpoint]] = defaultdict(set)
 	for endpoint, cfg in domain_configurations.items():
 		if cfg.is_default:
 			default += 1
@@ -638,7 +639,7 @@ def configuration_statistics(
 	grp = table.add_group("Domain configurations (HTTPS)", encrypted, column)
 	table.add_row(grp, "FS", len(fs), column)
 	table.add_row(grp, "CT", len(ct), column)
-	for tls_version in ats.TlsVersion:
+	for tls_version in tls.Version:
 		table.add_row(grp, str(tls_version), len(tls[tls_version]), column)
 	table.add_row(grp, "Most secure", most_secure, column)
 	table.add_row(grp, "Default", default, column)
@@ -1588,7 +1589,7 @@ def do_evaluate_configurations(
 							for endpoint in domain_endpoints
 							if (
 								configuration[endpoint][1] is None and
-								ats.TlsVersion.TLSv1_2 < configuration[endpoint][1].tls
+								tls.v1_2 < configuration[endpoint][1].tls
 							)
 						}
 				elif improvement.http != ats.Improvement(0):
@@ -1882,15 +1883,15 @@ def evaluate_configurations(
 			improve_any[dataset].append(0)
 
 		explicit_tls = 0
-		for tls in ats.TlsVersion:
+		for tls in tls.Version:
 			explicit_num = values[dataset].get(f"min {tls}", 0)
 			explicit[dataset].append(explicit_num)
 			explicit_tls += explicit_num
 			improve_all[dataset].append(0)
 			improve_any[dataset].append(0)
-		for tls in ats.TlsVersion:
+		for tls in tls.Version:
 			implicit[dataset].append(
-				totals[dataset] - explicit_tls if tls is ats.TlsVersion.TLSv1_2 else 0
+				totals[dataset] - explicit_tls if tls is tls.v1_2 else 0
 			)
 		explicit[dataset].append(0)
 		implicit[dataset].append(0)
@@ -2275,15 +2276,15 @@ def evaluate_trackers(
 			improve_any[dataset].append(0)
 
 		explicit_tls = 0
-		for tls in ats.TlsVersion:
+		for tls in tls.Version:
 			explicit_num = values[dataset].get(f"min {tls}", 0)
 			explicit[dataset].append(explicit_num)
 			explicit_tls += explicit_num
 			improve_all[dataset].append(0)
 			improve_any[dataset].append(0)
-		for tls in ats.TlsVersion:
+		for tls in tls.Version:
 			implicit[dataset].append(
-				totals[dataset] - explicit_tls if tls is ats.TlsVersion.TLSv1_2 else 0
+				totals[dataset] - explicit_tls if tls is tls.v1_2 else 0
 			)
 		explicit[dataset].append(0)
 		implicit[dataset].append(0)
