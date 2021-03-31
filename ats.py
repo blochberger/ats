@@ -796,7 +796,7 @@ class ActualDomainConfiguration:
 	http: Optional[bool] = None
 	fs: Optional[bool] = None
 	ct: Optional[bool] = None
-	tls: Optional[tls.Version] = None
+	tls_version: Optional[tls.Version] = None
 
 	@property
 	def is_default(self) -> bool:
@@ -804,7 +804,7 @@ class ActualDomainConfiguration:
 			self.http is None or not self.http,
 			self.fs is None or self.fs,
 			self.ct is None or not self.ct,
-			self.tls is None or self.tls is tls.v1_2,
+			self.tls_version is None or self.tls_version is tls.v1_2,
 		])
 
 	def compare_to_diagnosed(
@@ -826,10 +826,10 @@ class ActualDomainConfiguration:
 		if other.certificate_transparency and self.ct is not None and not self.ct:
 			explicit |= Improvement.CanEnableCT
 
-		if self.tls is None and tls.v1_2 < other.tls_version:
+		if self.tls_version is None and tls.v1_2 < other.tls_version:
 			implicit |= Improvement.CanUpgradeTLS
 
-		if self.tls is not None and self.tls < other.tls_version:
+		if self.tls_version is not None and self.tls_version < other.tls_version:
 			explicit |= Improvement.CanUpgradeTLS
 
 		if self.requires_justification and not other.requires_justification:
@@ -843,7 +843,7 @@ class ActualDomainConfiguration:
 	def requires_justification(self) -> bool:
 		return any([
 			self.http is not None and self.http,
-			self.tls is not None and self.tls < tls.v1_2,
+			self.tls_version is not None and self.tls_version < tls.v1_2,
 		])
 
 	@classmethod
@@ -853,7 +853,7 @@ class ActualDomainConfiguration:
 			http=True,
 			fs=False,
 			ct=False,
-			tls=tls.v1_0,
+			tls_version=tls.v1_0,
 		)
 
 	@classmethod
@@ -879,12 +879,12 @@ class ActualDomainConfiguration:
 			if type(value) is bool:
 				ct = value
 
-		tls: Optional[tls.Version] = None
+		tls_version: Optional[tls.Version] = None
 		for key, is_deprecated in key_variants('NSExceptionMinimumTLSVersion'):
 			if raw := ats_dict.get(key, None):
 				if type(raw) is str:
 					try:
-						tls = tls.Version.from_str(raw)
+						tls_version = tls.Version.from_str(raw)
 						break
 					except ValueError:
 						pass
@@ -894,7 +894,7 @@ class ActualDomainConfiguration:
 			http=http,
 			fs=fs,
 			ct=ct,
-			tls=tls,
+			tls_version=tls_version,
 		)
 
 
