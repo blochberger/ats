@@ -1881,14 +1881,17 @@ def evaluate_configurations(
 			improve_all[dataset].append(0)
 			improve_any[dataset].append(0)
 
+		explicit_tls = 0
 		for tls in ats.TlsVersion:
 			explicit_num = values[dataset].get(f"min {tls}", 0)
 			explicit[dataset].append(explicit_num)
-			implicit[dataset].append(
-				totals[dataset] - explicit_num if tls is ats.TlsVersion.TLSv1_2 else 0
-			)
+			explicit_tls += explicit_num
 			improve_all[dataset].append(0)
 			improve_any[dataset].append(0)
+		for tls in ats.TlsVersion:
+			implicit[dataset].append(
+				totals[dataset] - explicit_tls if tls is ats.TlsVersion.TLSv1_2 else 0
+			)
 		explicit[dataset].append(0)
 		implicit[dataset].append(0)
 		i_all = improvements_all[dataset].get(ats.Improvement.CanUpgradeTLS, 0)
