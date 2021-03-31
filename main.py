@@ -1525,7 +1525,7 @@ def do_evaluate_configurations(
 					improvements_any_per_app[improvement].add(app)
 
 				# Only look at all the domains affected by this improvement that
-				# do not already support the paramter that can be improved.
+				# do not already support the parameter that can be improved.
 				domain_endpoints = endpoints_for_domain[domain]
 				if improvement.http != ats.Improvement(0):
 					domain_endpoints = {e for e in domain_endpoints if not e.uses_tls}
@@ -1688,13 +1688,13 @@ def evaluate_configurations(
 			for improvement in ats.Improvement:
 				table.add_row(
 					grp,
-					f"{improvement} (any for any domain)",
+					f"{improvement} (any)",
 					improvements_any_per_app[dataset].get(improvement, 0),
 					dataset,
 				)
 				table.add_row(
 					grp,
-					f"{improvement} (all for any domain)",
+					f"{improvement} (all)",
 					improvements_all_per_app[dataset].get(improvement, 0),
 					dataset,
 				)
@@ -1707,13 +1707,13 @@ def evaluate_configurations(
 		for improvement in ats.Improvement:
 			table.add_row(
 				grp,
-				f"{improvement} (any in any app)",
+				f"{improvement} (any)",
 				improvements_any_per_domain[dataset].get(improvement, 0),
 				dataset,
 			)
 			table.add_row(
 				grp,
-				f"{improvement} (all in any app)",
+				f"{improvement} (all)",
 				improvements_all_per_domain[dataset].get(improvement, 0),
 				dataset,
 			)
@@ -2039,7 +2039,6 @@ def print_endpoints(maap_dir: str):
 		for endpoint in app.endpoints:
 			if endpoint.is_relevant:
 				click.echo(endpoint)
-
 
 @cli.group()
 def test_environment():
