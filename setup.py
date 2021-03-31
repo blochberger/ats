@@ -21,6 +21,7 @@ setup(
 		'matplotlib',
 		'natsort',
 		'pyopenssl',
+		'requests',
 		'tqdm',
 	],
 	extras_require=dict(
