@@ -2,7 +2,6 @@ import enum
 import json
 import plistlib
 import re
-import ssl
 import subprocess
 import tempfile
 
@@ -14,8 +13,6 @@ from pathlib import Path
 from typing import Any, Dict, Iterator, List, Optional, Set, Tuple
 from typing_extensions import Protocol
 from urllib.parse import urlparse
-
-import OpenSSL
 
 from click import style, unstyle
 
@@ -255,38 +252,6 @@ class Action(enum.Flag):
 
 
 @dataclass(frozen=True)
-class Certificate:
-	crt: OpenSSL.crypto.X509
-
-	@property
-	def expiry_date(self) -> datetime:
-		raw = self.crt.get_notAfter().decode()
-		assert 14 <= len(raw)
-		value = '-'.join([
-			raw[:4],  # year
-			raw[4:6],  # month
-			raw[6:8],  # day
-		])
-		value += 'T'
-		value += ':'.join([
-			raw[8:10],  # hour
-			raw[10:12],  # minute
-			raw[12:14],  # seconds
-		])
-		value += raw[14:]  # time zone
-		return timestamp_from_str(value)
-
-	@property
-	def is_expired(self) -> bool:
-		return self.expiry_date < datetime.now(timezone.utc)
-
-	@classmethod
-	def from_pem(cls, pem: str) -> 'Certificate':
-		crt = OpenSSL.crypto.load_certificate(OpenSSL.crypto.FILETYPE_PEM, pem)
-		return cls(crt)
-
-
-@dataclass(frozen=True)
 class Endpoint:
 	uses_tls: bool
 	host: str
@@ -329,14 +294,10 @@ class Endpoint:
 		)
 
 	@cached_property
-	def certificate(self) -> Optional[Certificate]:
-		try:
-			pem = ssl.get_server_certificate((self.host, self.port))
-			return Certificate.from_pem(pem)
-		except ssl.SSLError:
+	def certificate(self) -> Optional[tls.Certificate]:
+		if not self.uses_tls:
 			return None
-		except ConnectionResetError:
-			return None
+		return tls.Certificate.from_server(self.host, self.port)
 
 	def __lt__(self, other: Any) -> bool:
 		if type(other) is not Endpoint:
