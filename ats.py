@@ -7,7 +7,7 @@ import subprocess
 import tempfile
 
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import datetime
 from functools import cached_property
 from ipaddress import ip_address
 from pathlib import Path
@@ -20,6 +20,7 @@ import OpenSSL
 from click import style, unstyle
 
 import tls
+from utils import timestamp_from_str
 from utilities import CodesigningIdentity, State, Utility
 
 
@@ -82,13 +83,6 @@ def is_valid_host(value: str) -> bool:
 	# Only lower-case hostnames should be used
 	rx = re.compile(r'(?!-)[a-z0-9-]{1,63}(?<!-)$')
 	return all(rx.match(part) for part in value.split('.'))
-
-
-def timestamp_from_str(value: str) -> datetime:
-	# Python cannot handle Z-marker
-	if value.endswith('Z'):
-		value = value[:-1] + '+00:00'
-	return datetime.fromisoformat(value)
 
 
 def key_variants(key: str) -> Iterator[Tuple[str, bool]]:

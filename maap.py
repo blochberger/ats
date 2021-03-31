@@ -15,6 +15,7 @@ from natsort import natsorted
 
 import ats
 
+from utils import timestamp_from_str
 from utilities import PlistSanitizer
 
 
@@ -42,14 +43,14 @@ class Metadata:
 		value = self.raw.get('releaseDate', None)
 		if type(value) is not str:
 			return None
-		return ats.timestamp_from_str(value)
+		return timestamp_from_str(value)
 
 	@cached_property
 	def current_version_release_date(self) -> Optional[datetime]:
 		value = self.raw.get('currentVersionReleaseDate', None)
 		if type(value) is not str:
 			return None
-		return ats.timestamp_from_str(value)
+		return timestamp_from_str(value)
 
 	@classmethod
 	def from_scrape_dump(cls, path: Path) -> Dict[str, 'Metadata']:
