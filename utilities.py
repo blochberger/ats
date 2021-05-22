@@ -37,7 +37,7 @@ class CodesigningIdentity:
 		lines = security.stdout.splitlines(keepends=False)
 		identities: List['CodesigningIdentity'] = []
 		for line in lines:
-			m: Optional[re.Match] = cls.sha1_rx.search(lines[0])
+			m: Optional[re.Match] = cls.sha1_rx.search(line)
 			if m:
 				identities.append(cls(m.group(0)))
 		return identities

@@ -747,6 +747,8 @@ class CodesigningIdentityParam(click.ParamType):
 			identity = CodesigningIdentity.detect_first()
 			if identity:
 				return identity
+		if type(value) is CodesigningIdentity:
+			return value
 		try:
 			return CodesigningIdentity(value)
 		except ValueError:
@@ -1483,8 +1485,8 @@ def do_evaluate_configurations(
 					per_app[key].add(app)
 					per_domain[key].add(domain)
 
-			if exception.tls is not None:
-				key = f"min {exception.tls}"
+			if exception.tls_version is not None:
+				key = f"min {exception.tls_version}"
 				per_app[key].add(app)
 				per_domain[key].add(domain)
 
@@ -1883,15 +1885,15 @@ def evaluate_configurations(
 			improve_any[dataset].append(0)
 
 		explicit_tls = 0
-		for tls in tls.Version:
-			explicit_num = values[dataset].get(f"min {tls}", 0)
+		for tls_version in tls.Version:
+			explicit_num = values[dataset].get(f"min {tls_version}", 0)
 			explicit[dataset].append(explicit_num)
 			explicit_tls += explicit_num
 			improve_all[dataset].append(0)
 			improve_any[dataset].append(0)
-		for tls in tls.Version:
+		for tls_version in tls.Version:
 			implicit[dataset].append(
-				totals[dataset] - explicit_tls if tls is tls.v1_2 else 0
+				totals[dataset] - explicit_tls if tls_version is tls.v1_2 else 0
 			)
 		explicit[dataset].append(0)
 		implicit[dataset].append(0)
