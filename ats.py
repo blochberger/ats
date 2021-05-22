@@ -16,6 +16,7 @@ from urllib.parse import urlparse
 
 from click import style, unstyle
 
+import ns
 import tls
 from utils import timestamp_from_str
 from utilities import CodesigningIdentity, State, Utility
@@ -80,24 +81,6 @@ def is_valid_host(value: str) -> bool:
 	# Only lower-case hostnames should be used
 	rx = re.compile(r'(?!-)[a-z0-9-]{1,63}(?<!-)$')
 	return all(rx.match(part) for part in value.split('.'))
-
-
-def key_variants(key: str) -> Iterator[Tuple[str, bool]]:
-	assert key.startswith('NSException')
-	suffix = key[len('NSException'):]
-
-	assert suffix in {
-		'AllowsInsecureHTTPLoads',
-		'MinimumTLSVersion',
-		'RequiresForwardSecrecy',
-	}
-
-	# Order of prefixes is important!
-	prefixes = ['', 'ThirdParty', 'Temporary', 'TemporaryThirdParty']
-
-	for i, prefix in enumerate(prefixes):
-		variant = 'NS' + prefix + 'Exception' + suffix
-		yield (variant, 0 < i)
 
 
 def get_bool(source: Dict[str, Any], key: str, default: bool, strict: bool = True) -> bool:
@@ -593,19 +576,19 @@ class DomainConfiguration:
 		configuration: Dict[str, Any] = dict()
 
 		if not simplify or self.includes_subdomains != default.includes_subdomains:
-			configuration['NSIncludesSubdomains'] = self.includes_subdomains
+			configuration[ns.IncludesSubdomains] = self.includes_subdomains
 
 		if not simplify or self.insecure_http_loads != default.insecure_http_loads:
-			configuration['NSExceptionAllowsInsecureHTTPLoads'] = self.insecure_http_loads
+			configuration[ns.InsecureHTTPLoads] = self.insecure_http_loads
 
 		if not simplify or self.tls_version != default.tls_version:
-			configuration['NSExceptionMinimumTLSVersion'] = str(self.tls_version)
+			configuration[ns.MinimumTlsVersion] = str(self.tls_version)
 
 		if not simplify or self.forward_secrecy != default.forward_secrecy:
-			configuration['NSExceptionRequiresForwardSecrecy'] = self.forward_secrecy
+			configuration[ns.RequiresForwardSecrecy] = self.forward_secrecy
 
 		if not simplify or self.certificate_transparency != default.certificate_transparency:
-			configuration['NSRequiresCertificateTransparency'] = self.certificate_transparency
+			configuration[ns.RequiresCertificateTransparency] = self.certificate_transparency
 
 		return configuration
 
@@ -861,14 +844,14 @@ class ActualDomainConfiguration:
 		includes_subdomains = get_bool(ats_dict, 'NSIncludesSubdomains', False, strict=False)
 
 		http: Optional[bool] = None
-		for key, is_deprecated in key_variants('NSExceptionAllowsInsecureHTTPLoads'):
+		for key, is_deprecated in ns.key_variants('NSExceptionAllowsInsecureHTTPLoads'):
 			if value := ats_dict.get(key, None):
 				if type(value) is bool:
 					http = value
 					break
 
 		fs: Optional[bool] = None
-		for key, is_deprecated in key_variants('NSExceptionRequiresForwardSecrecy'):
+		for key, is_deprecated in ns.key_variants('NSExceptionRequiresForwardSecrecy'):
 			if value := ats_dict.get(key, None):
 				if type(value) is bool:
 					fs = value
@@ -880,7 +863,7 @@ class ActualDomainConfiguration:
 				ct = value
 
 		tls_version: Optional[tls.Version] = None
-		for key, is_deprecated in key_variants('NSExceptionMinimumTLSVersion'):
+		for key, is_deprecated in ns.key_variants('NSExceptionMinimumTLSVersion'):
 			if raw := ats_dict.get(key, None):
 				if type(raw) is str:
 					try:
